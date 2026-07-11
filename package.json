@@ -1,0 +1,22 @@
+{
+  "name": "tank-multiplayer-server",
+  "version": "1.0.0",
+  "description": "Lobby + turn relay server for the Tanks game",
+  "main": "index.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "nodemon index.js"
+  },
+  "dependencies": {
+    "@colyseus/tools": "^0.15.16",
+    "colyseus": "^0.15.28",
+    "express": "^4.19.2"
+  },
+  "devDependencies": {
+    "nodemon": "^3.1.4"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
