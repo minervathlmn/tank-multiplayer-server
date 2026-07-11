@@ -9,12 +9,17 @@
     "dev": "nodemon index.js"
   },
   "dependencies": {
-    "@colyseus/tools": "^0.15.16",
-    "colyseus": "^0.15.28",
+    "@colyseus/core": "^0.16.24",
+    "@colyseus/redis-driver": "^0.16.1",
+    "@colyseus/redis-presence": "^0.16.4",
+    "@colyseus/schema": "^3.0.76",
+    "@colyseus/tools": "^0.16.20",
+    "@colyseus/ws-transport": "^0.16.5",
+    "colyseus": "^0.16.5",
     "express": "^4.19.2"
   },
   "devDependencies": {
-    "nodemon": "^3.1.4"
+    "nodemon": "^3.1.14"
   },
   "engines": {
     "node": ">=18"

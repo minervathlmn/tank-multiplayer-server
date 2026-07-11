@@ -1,8 +1,7 @@
 // app.config.js
-const { defineConfig } = require("@colyseus/tools");
 const { TankRoom } = require("./rooms/TankRoom");
 
-module.exports = defineConfig({
+module.exports = {
   options: {
     devMode: false,
   },
@@ -35,4 +34,4 @@ module.exports = defineConfig({
   },
 
   beforeListen: () => {},
-});
+};
