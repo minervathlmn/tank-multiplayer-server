@@ -76,6 +76,26 @@ class TankRoom extends Room {
       this.disconnect();
     });
 
+    // Owner removes a single player. We deliberately don't touch
+    // state.players here ourselves — calling target.leave() triggers
+    // this room's own onLeave(), which already handles removal, owner
+    // handoff, turn-skipping, and metadata updates in one place.
+    this.onMessage("kickPlayer", (client, payload) => {
+      const player = this.state.players.get(client.sessionId);
+      if (!player || !player.isOwner) return;
+
+      const targetSessionId = payload?.sessionId;
+      if (!targetSessionId || targetSessionId === client.sessionId) return;
+
+      const targetClient = this.clients.find(
+        (c) => c.sessionId === targetSessionId
+      );
+      if (!targetClient) return;
+
+      targetClient.send("kicked");
+      targetClient.leave();
+    });
+
     // Owner presses "Start". Only allowed once everyone is ready.
     this.onMessage("start", (client) => {
       const player = this.state.players.get(client.sessionId);
@@ -113,6 +133,19 @@ class TankRoom extends Room {
   }
 
   onJoin(client, options) {
+    // Authoritative privacy check. filterBy(["isPrivate"]) only reflects
+    // the value passed at room CREATION time — if the owner later toggles
+    // the lobby private via setVisibility, that filterBy cache goes stale
+    // and Quick Join's joinOrCreate() can still match this room. This is
+    // the actual gate that keeps a private lobby private, regardless of
+    // whether the client arrived via Quick Join, Join by Code, or the
+    // public room list.
+    if (this.state.isPrivate && options.code !== this.state.code) {
+      // Throwing here rejects the client's join()/joinOrCreate() promise
+      // with this message and releases the seat — nothing gets added to
+      // state.players.
+      throw new Error("This lobby is private. Ask the host for the code.");
+    }
     const player = new Player();
     player.nickname = (options.nickname || "Player").slice(0, 16);
     player.color = COLORS[this.state.players.size] || "gray";
