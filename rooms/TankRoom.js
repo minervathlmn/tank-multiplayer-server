@@ -1,4 +1,5 @@
 // rooms/TankRoom.js
+
 // One instance of this = one lobby/game (matches your "Create Lobby" screen).
 // It does NOT run tank physics — it just relays turn actions and keeps
 // everyone's lobby state in sync. Each client still runs your existing
@@ -8,6 +9,12 @@ const { Room } = require("colyseus");
 const { TankRoomState, Player } = require("./schema/TankRoomState");
 
 const COLORS = ["red", "blue", "green", "yellow"];
+
+// Generates a random 4-digit code as a string, e.g. "4213", "0067".
+// Kept as a string (not a number) so leading zeros display correctly.
+function generateCode() {
+  return String(Math.floor(1000 + Math.random() * 9000));
+}
 
 class TankRoom extends Room {
   maxClients = 4;
@@ -19,9 +26,15 @@ class TankRoom extends Room {
 
     const isPrivate = !!options.isPrivate;
     const ownerNickname = (options.nickname || "Player").slice(0, 16);
+    const code = isPrivate ? generateCode() : "";
+
+    this.state.isPrivate = isPrivate;
+    this.state.code = code;
+    this.state.ownerNickname = ownerNickname;
 
     this.setMetadata({
       isPrivate,
+      code,
       ownerNickname,
       playerCount: 0,
     });
@@ -32,6 +45,35 @@ class TankRoom extends Room {
     this.onMessage("ready", (client, ready) => {
       const player = this.state.players.get(client.sessionId);
       if (player) player.ready = !!ready;
+    });
+
+    // Owner toggles the lobby between public and private.
+    // Switching to private generates a fresh code; switching to public
+    // clears it. Both state (for in-room display) and metadata (so
+    // getAvailableRooms/quick-join see the change) are updated together.
+    this.onMessage("setVisibility", (client, payload) => {
+      const player = this.state.players.get(client.sessionId);
+      if (!player || !player.isOwner) return;
+      if (this.state.started) return;
+
+      const wantPrivate = !!payload?.isPrivate;
+      this.state.isPrivate = wantPrivate;
+      this.state.code = wantPrivate ? generateCode() : "";
+
+      this.setMetadata({
+        ...this.metadata,
+        isPrivate: wantPrivate,
+        code: this.state.code,
+      });
+    });
+
+    // Owner closes the lobby entirely — kicks everyone, not just self.
+    this.onMessage("closeLobby", (client) => {
+      const player = this.state.players.get(client.sessionId);
+      if (!player || !player.isOwner) return;
+
+      this.broadcast("lobbyClosed");
+      this.disconnect();
     });
 
     // Owner presses "Start". Only allowed once everyone is ready.
@@ -75,7 +117,8 @@ class TankRoom extends Room {
     player.nickname = (options.nickname || "Player").slice(0, 16);
     player.color = COLORS[this.state.players.size] || "gray";
     player.isOwner = this.state.players.size === 0; // first joiner owns the lobby
-    player.ready = false;
+    // No "ready" step in the current UI — everyone who joins is ready to go.
+    player.ready = true;
     player.connected = true;
 
     this.state.players.set(client.sessionId, player);
@@ -97,6 +140,7 @@ class TankRoom extends Room {
       const nextSessionId = [...this.state.players.keys()][0];
       if (nextSessionId) {
         this.state.players.get(nextSessionId).isOwner = true;
+        this.state.ownerNickname = this.state.players.get(nextSessionId).nickname;
       }
     }
 
