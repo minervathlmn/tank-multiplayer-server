@@ -1,17 +1,26 @@
 // rooms/TankRoom.js
-
-// One instance of this = one lobby/game (matches your "Create Lobby" screen).
-// It does NOT run tank physics — it just relays turn actions and keeps
-// everyone's lobby state in sync. Each client still runs your existing
-// Tank.js / GameLogic.js locally and trusts the relayed action to replay it.
+//
+// One instance of this = one lobby/game. The server is NOT a physics
+// simulator — it only tracks whose turn it is and relays that player's
+// input to everyone (lockstep networking). Every client runs the same
+// deterministic GameLogic/Tank code on the same relayed input, seeded
+// with the same wind seed, so all four screens converge on their own.
 
 const { Room } = require("colyseus");
 const { TankRoomState, Player } = require("./schema/TankRoomState");
 
 const COLORS = ["red", "blue", "green", "yellow"];
+const LETTERS = ["A", "B", "C", "D"];
 
-// Generates a random 4-digit code as a string, e.g. "4213", "0067".
-// Kept as a string (not a number) so leading zeros display correctly.
+// Turn-gated actions: only the current turn-holder's client may send
+// these, and they get relayed verbatim to every connected client
+// (including the sender) so everyone runs the identical Tank method.
+const TURN_ACTIONS = new Set([
+  "rotateLeft", "rotateRight", "moveLeft", "moveRight",
+  "morePower", "lessPower", "stopAdjustment",
+  "fire", "repair", "addFuel", "addParachute", "xtra",
+]);
+
 function generateCode() {
   return String(Math.floor(1000 + Math.random() * 9000));
 }
@@ -19,8 +28,6 @@ function generateCode() {
 class TankRoom extends Room {
   maxClients = 4;
 
-  // Called once when the room is first created (by "Create Lobby" or
-  // by joinOrCreate() during a "Quick Join").
   onCreate(options) {
     this.setState(new TankRoomState());
 
@@ -31,33 +38,24 @@ class TankRoom extends Room {
     this.state.isPrivate = isPrivate;
     this.state.code = code;
     this.state.ownerNickname = ownerNickname;
-
-    // Not part of the schema (never synced) — just remembers the code
-    // across public/private toggles so switching public -> private ->
-    // public -> private again reuses the same code instead of minting a
-    // new one each time. state.code itself still gets blanked out while
-    // public, since that's what gates join-by-code and the code display.
     this.reservedCode = code;
 
-    this.setMetadata({
-      isPrivate,
-      code,
-      ownerNickname,
-      playerCount: 0,
-    });
+    // Fixed at "start" time — index 0 is always the owner ("player A" /
+    // red), regardless of who leaves later. letterOrder mirrors the
+    // alphabetical player-id order GameLogic.generateLevel() always
+    // produces (see the sort in that file).
+    this.sessionIds = [];
+    this.letterOrder = [];
 
-    // --- message handlers -------------------------------------------
+    this.setMetadata({ isPrivate, code, ownerNickname, playerCount: 0 });
 
-    // A player toggles "ready" in the lobby.
+    // --- lobby message handlers ---------------------------------------
+
     this.onMessage("ready", (client, ready) => {
       const player = this.state.players.get(client.sessionId);
       if (player) player.ready = !!ready;
     });
 
-    // Owner toggles the lobby between public and private.
-    // Switching to private generates a fresh code; switching to public
-    // clears it. Both state (for in-room display) and metadata (so
-    // getAvailableRooms/quick-join see the change) are updated together.
     this.onMessage("setVisibility", (client, payload) => {
       const player = this.state.players.get(client.sessionId);
       if (!player || !player.isOwner) return;
@@ -65,9 +63,6 @@ class TankRoom extends Room {
 
       const wantPrivate = !!payload?.isPrivate;
       this.state.isPrivate = wantPrivate;
-      // Reuse the reserved code across public -> private -> public ->
-      // private toggles; only mint a new one the first time this lobby
-      // ever goes private.
       if (wantPrivate) {
         if (!this.reservedCode) this.reservedCode = generateCode();
         this.state.code = this.reservedCode;
@@ -75,14 +70,9 @@ class TankRoom extends Room {
         this.state.code = "";
       }
 
-      this.setMetadata({
-        ...this.metadata,
-        isPrivate: wantPrivate,
-        code: this.state.code,
-      });
+      this.setMetadata({ ...this.metadata, isPrivate: wantPrivate, code: this.state.code });
     });
 
-    // Owner closes the lobby entirely — kicks everyone, not just self.
     this.onMessage("closeLobby", (client) => {
       const player = this.state.players.get(client.sessionId);
       if (!player || !player.isOwner) return;
@@ -91,10 +81,6 @@ class TankRoom extends Room {
       this.disconnect();
     });
 
-    // Owner removes a single player. We deliberately don't touch
-    // state.players here ourselves — calling target.leave() triggers
-    // this room's own onLeave(), which already handles removal, owner
-    // handoff, turn-skipping, and metadata updates in one place.
     this.onMessage("kickPlayer", (client, payload) => {
       const player = this.state.players.get(client.sessionId);
       if (!player || !player.isOwner) return;
@@ -102,88 +88,180 @@ class TankRoom extends Room {
       const targetSessionId = payload?.sessionId;
       if (!targetSessionId || targetSessionId === client.sessionId) return;
 
-      const targetClient = this.clients.find(
-        (c) => c.sessionId === targetSessionId
-      );
+      const targetClient = this.clients.find((c) => c.sessionId === targetSessionId);
       if (!targetClient) return;
 
       targetClient.send("kicked");
       targetClient.leave();
     });
 
-    // Owner presses "Start". Only allowed once everyone is ready.
+    // Owner presses "Start". Locks in turn order (join order) and a
+    // shared wind seed, then broadcasts both to every client.
     this.onMessage("start", (client) => {
       const player = this.state.players.get(client.sessionId);
-      if (!player || !player.isOwner) return; // only the owner can start
+      if (!player || !player.isOwner) return;
       if (this.state.started) return;
 
       const allReady = [...this.state.players.values()].every((p) => p.ready);
       if (!allReady || this.state.players.size < 2) return;
 
       this.state.started = true;
-      const firstSessionId = [...this.state.players.keys()][0];
-      this.state.currentTurnSessionId = firstSessionId;
+
+      this.sessionIds = [...this.state.players.keys()]; // owner first, forever
+      this.letterOrder = LETTERS.slice(0, this.sessionIds.length);
+      this.state.currentTurnSessionId = this.sessionIds[0];
+
+      // Server-authoritative elimination tracking. Clients report deaths
+      // via "eliminated"; this array (not any client's local state) is
+      // what turn advancement is computed from, so a lagging/desynced
+      // client's stale view of who's alive can never corrupt turn order.
+      this.remainingSessionIds = [...this.sessionIds];
+      this.turnIndex = 0;
+
+      const seed = Math.floor(Math.random() * 2 ** 31);
 
       this.broadcast("gameStart", {
-        turnOrder: [...this.state.players.keys()],
+        turnOrder: this.sessionIds,
+        seed,
       });
     });
 
-    // A player fires. We don't simulate physics here — we just verify
-    // whose turn it is, then relay the shot to everyone (including the
-    // sender, for consistency) and advance the turn.
-    this.onMessage("fire", (client, action) => {
+    // --- in-game message handlers ---------------------------------------
+
+    // Any connected client reports a tank death the moment it sees one
+    // locally (health <= 0 during its own tick). First report wins;
+    // duplicates/late reports from other clients are ignored. This is
+    // what remainingSessionIds is built from — never any single client's
+    // "nextLetter" guess — so a client that's briefly desynced (e.g. a
+    // throttled background tab) can't corrupt turn order for everyone.
+    this.onMessage("eliminated", (client, payload) => {
+      if (!this.state.started) return;
+
+      const idx = this.letterOrder.indexOf(payload?.letter);
+      if (idx === -1) return;
+
+      const sessionId = this.sessionIds[idx];
+      const pos = this.remainingSessionIds.indexOf(sessionId);
+      if (pos === -1) return; // already removed / duplicate report
+
+      this.remainingSessionIds.splice(pos, 1);
+      this.broadcast("eliminated", { letter: payload.letter });
+    });
+
+    // Generic relay for any turn-gated input. The server never touches
+    // tank state itself — it just checks whose turn it is, then echoes
+    // the action to every client so they all apply it identically.
+    this.onMessage("action", (client, payload) => {
       if (!this.state.started) return;
       if (client.sessionId !== this.state.currentTurnSessionId) return;
 
-      // action expected shape: { angle: number, power: number }
-      this.broadcast("shotFired", {
-        sessionId: client.sessionId,
-        angle: action?.angle,
-        power: action?.power,
-      });
+      const type = payload?.type;
+      if (!TURN_ACTIONS.has(type)) return;
 
-      this.advanceTurn();
+      this.broadcast("action", { type });
+
+      if (type === "fire") {
+        // Turn advancement is computed server-side from remainingSessionIds
+        // (built purely from confirmed "eliminated" reports), not from any
+        // client-supplied "nextLetter" — that value used to be trusted
+        // directly, which let a desynced client hand the turn to the
+        // wrong session and cascade the turn order for the rest of the game.
+        if (this.remainingSessionIds.length > 1) {
+          let guard = 0;
+          do {
+            this.turnIndex = (this.turnIndex + 1) % this.sessionIds.length;
+            guard++;
+          } while (
+            !this.remainingSessionIds.includes(this.sessionIds[this.turnIndex]) &&
+            guard <= this.sessionIds.length
+          );
+          this.state.currentTurnSessionId = this.sessionIds[this.turnIndex];
+        }
+      }
+    });
+
+    // Not turn-gated — any connected player can trigger a restart once
+    // the level/game is over (mirrors the local 'R'-to-restart key).
+    this.onMessage("restart", (client) => {
+      if (!this.state.started) return;
+      this.broadcast("restart");
     });
   }
 
   onJoin(client, options) {
-    // Authoritative privacy check. filterBy(["isPrivate"]) only reflects
-    // the value passed at room CREATION time — if the owner later toggles
-    // the lobby private via setVisibility, that filterBy cache goes stale
-    // and Quick Join's joinOrCreate() can still match this room. This is
-    // the actual gate that keeps a private lobby private, regardless of
-    // whether the client arrived via Quick Join, Join by Code, or the
-    // public room list.
     if (this.state.isPrivate && options.code !== this.state.code) {
-      // Throwing here rejects the client's join()/joinOrCreate() promise
-      // with this message and releases the seat — nothing gets added to
-      // state.players.
       throw new Error("This lobby is private. Ask the host for the code.");
     }
     const player = new Player();
     player.nickname = (options.nickname || "Player").slice(0, 16);
     player.color = COLORS[this.state.players.size] || "gray";
-    player.isOwner = this.state.players.size === 0; // first joiner owns the lobby
-    // No "ready" step in the current UI — everyone who joins is ready to go.
+    player.isOwner = this.state.players.size === 0;
     player.ready = true;
     player.connected = true;
 
     this.state.players.set(client.sessionId, player);
 
-    this.setMetadata({
-      ...this.metadata,
-      playerCount: this.state.players.size,
-    });
+    this.setMetadata({ ...this.metadata, playerCount: this.state.players.size });
   }
 
-  onLeave(client) {
+  // onLeave(client) {
+  //   const player = this.state.players.get(client.sessionId);
+  //   if (!player) return;
+
+  //   this.state.players.delete(client.sessionId);
+
+  //   if (player.isOwner) {
+  //     const nextSessionId = [...this.state.players.keys()][0];
+  //     if (nextSessionId) {
+  //       this.state.players.get(nextSessionId).isOwner = true;
+  //       this.state.ownerNickname = this.state.players.get(nextSessionId).nickname;
+  //     }
+  //   }
+
+  //   // Emergency fallback only (mid-game disconnect): simple round robin
+  //   // over whoever's still connected. Turn-holder's own client normally
+  //   // drives currentTurnSessionId via the "fire" nextLetter mapping above.
+  //   if (this.state.started && this.state.currentTurnSessionId === client.sessionId) {
+  //     const remaining = [...this.state.players.keys()];
+  //     if (remaining.length) this.state.currentTurnSessionId = remaining[0];
+  //   }
+
+  //   this.setMetadata({ ...this.metadata, playerCount: this.state.players.size });
+
+  //   if (this.state.players.size === 0) {
+  //     this.disconnect();
+  //   }
+  // }
+
+  async onLeave(client, consented) {
+    const player = this.state.players.get(client.sessionId);
+    if (!player) return;
+
+    // Kicked players / explicit leaves close with a normal code -> consented
+    // is true, so remove them immediately, no reconnection grace period.
+    if (consented) {
+      this.removePlayer(client);
+      return;
+    }
+
+    player.connected = false;
+    try {
+      // Covers the Start -> game page navigation, which always drops the
+      // socket for a moment, plus genuine network blips. 15s grace period.
+      await this.allowReconnection(client, 15);
+      player.connected = true;
+    } catch (e) {
+      // Didn't come back in time - actually gone.
+      this.removePlayer(client);
+    }
+  }
+
+  removePlayer(client) {
     const player = this.state.players.get(client.sessionId);
     if (!player) return;
 
     this.state.players.delete(client.sessionId);
 
-    // If the owner left, hand ownership to whoever's next (if anyone).
     if (player.isOwner) {
       const nextSessionId = [...this.state.players.keys()][0];
       if (nextSessionId) {
@@ -192,29 +270,24 @@ class TankRoom extends Room {
       }
     }
 
-    // If it was this player's turn, skip to the next one.
-    if (this.state.currentTurnSessionId === client.sessionId) {
-      this.advanceTurn();
+    // Keep the elimination-tracking array in sync so a departed player
+    // can never get stuck counted as "still alive" and jam the
+    // turn-skip loop in the "fire" handler above.
+    if (this.remainingSessionIds) {
+      const rIdx = this.remainingSessionIds.indexOf(client.sessionId);
+      if (rIdx !== -1) this.remainingSessionIds.splice(rIdx, 1);
     }
 
-    this.setMetadata({
-      ...this.metadata,
-      playerCount: this.state.players.size,
-    });
+    if (this.state.started && this.state.currentTurnSessionId === client.sessionId) {
+      const remaining = [...this.state.players.keys()];
+      if (remaining.length) this.state.currentTurnSessionId = remaining[0];
+    }
 
-    // Close empty lobbies so they don't linger in the public list.
+    this.setMetadata({ ...this.metadata, playerCount: this.state.players.size });
+
     if (this.state.players.size === 0) {
       this.disconnect();
     }
-  }
-
-  advanceTurn() {
-    const sessionIds = [...this.state.players.keys()];
-    if (sessionIds.length === 0) return;
-
-    const currentIndex = sessionIds.indexOf(this.state.currentTurnSessionId);
-    const nextIndex = (currentIndex + 1) % sessionIds.length;
-    this.state.currentTurnSessionId = sessionIds[nextIndex];
   }
 }
 
