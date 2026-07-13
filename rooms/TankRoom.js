@@ -1,5 +1,5 @@
 // rooms/TankRoom.js
-//
+
 // One instance of this = one lobby/game. The server is NOT a physics
 // simulator — it only tracks whose turn it is and relays that player's
 // input to everyone (lockstep networking). Every client runs the same
