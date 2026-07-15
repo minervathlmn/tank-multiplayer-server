@@ -15,8 +15,9 @@ const { TankState } = require('./schema/TankState');
 const { GameLogic } = require('./logic/GameLogic');
 const { randomColour } = require('./logic/colour');
 
-// Board letters assigned by join order — room creator is always 'A', next
-// joiner 'B', etc. Fixed the moment someone joins, not deferred to "start".
+// Board letters assigned by join order, locked in once at "start" — room
+// creator is always 'A', next joiner 'B', etc., based on join order at
+// that moment (see the "start" handler and onJoin's comment for why).
 // This assumes every level layout defines start positions for these exact
 // letters; if a layout ever doesn't, "start" fails loudly (see below)
 // rather than silently spawning a mismatched or missing tank.
@@ -31,6 +32,15 @@ const TURN_ACTIONS = new Set([
 function generateCode() {
   return String(Math.floor(1000 + Math.random() * 9000));
 }
+
+// Kept short relative to the in-game grace (15s): a lobby refresh is a much
+// faster round-trip than a game-page reconnect (no level assets/canvas to
+// re-init) — this just needs to survive a normal reload (page teardown,
+// new document parse, script re-init, reconnect handshake), not cover a
+// real connection drop. Every second here is also a second the owner's
+// room may sit locked out of the public list/new joins if it's the owner
+// reconnecting, so err short rather than long.
+const LOBBY_RECONNECT_GRACE_SECONDS = 4;
 
 function loadLevels() {
   const levelsDir = path.join(__dirname, '../levels');
@@ -56,9 +66,9 @@ class TankRoom extends Room {
     this.levelLayouts = levelLayouts;
 
     this.game = null;             // GameLogic instance, created at "start"
-    this.sessionToLetter = new Map(); // built incrementally as players join
+    this.sessionToLetter = new Map(); // populated once, at "start" — see onJoin's comment
     this.letterToSession = new Map();
-    this.kickedSessionIds = new Set(); // tracks explicit kicks so onLeave can skip reconnection grace only for those
+    this.noReconnectSessionIds = new Set(); // explicit kicks/leaves — onLeave skips reconnection grace for these
 
     const isPrivate = !!options.isPrivate;
     const ownerNickname = (options.nickname || "Player").slice(0, 16);
@@ -103,6 +113,13 @@ class TankRoom extends Room {
       this.disconnect();
     });
 
+    this.onMessage("leaveLobby", (client) => {
+      // Client is about to call room.leave() intentionally (Leave/Back
+      // button) — this is the marker that tells onLeave to skip the
+      // reconnection grace period, same idea as a kick.
+      this.noReconnectSessionIds.add(client.sessionId);
+    });
+
     this.onMessage("kickPlayer", (client, payload) => {
       const player = this.state.players.get(client.sessionId);
       if (!player || !player.isOwner) return;
@@ -113,8 +130,20 @@ class TankRoom extends Room {
       const targetClient = this.clients.find((c) => c.sessionId === targetSessionId);
       if (!targetClient) return;
 
-      this.kickedSessionIds.add(targetSessionId);
+      this.noReconnectSessionIds.add(targetSessionId);
       targetClient.send("kicked");
+
+      // Remove the player from state right now instead of waiting for the
+      // socket to actually finish closing (targetClient.leave() only
+      // *initiates* the close — onLeave fires whenever that round-trip
+      // completes, which can be delayed on a slow connection, e.g. by the
+      // kicked client's own blocking alert() holding up its event loop).
+      // Without this, the owner's player list — and this room's
+      // metadata.playerCount, which Quick Join filters on — stayed stale
+      // for however long that took, sometimes looking like the lobby
+      // still had 4 players when it didn't.
+      this.removePlayer(targetClient);
+
       targetClient.leave();
     });
 
@@ -130,6 +159,26 @@ class TankRoom extends Room {
 
       const sessionIds = [...this.state.players.keys()]; // owner first, forever
       const seed = Math.floor(Math.random() * 2 ** 31);
+
+      // Letters are assigned here, fresh, from current join order — not
+      // maintained incrementally through the lobby (see onJoin's comment).
+      // Rebuilding both maps from scratch each time this handler runs is
+      // deliberate: it's idempotent, so a failed start attempt below
+      // (missing level start positions) just gets silently recomputed
+      // identically — or differently, if someone left/joined — on the
+      // next attempt, with no stale state to clean up either way.
+      this.sessionToLetter.clear();
+      this.letterToSession.clear();
+      sessionIds.forEach((sessionId, i) => {
+        const letter = LETTERS[i];
+        this.sessionToLetter.set(sessionId, letter);
+        this.letterToSession.set(letter, sessionId);
+
+        const seatedPlayer = this.state.players.get(sessionId);
+        seatedPlayer.letter = letter;
+        seatedPlayer.color = this.resolveColour(letter).join(",");
+      });
+
       const activeLetters = sessionIds.map((id) => this.sessionToLetter.get(id));
 
       this.game = new GameLogic(this.config, this.levelLayouts, seed, activeLetters);
@@ -313,6 +362,15 @@ class TankRoom extends Room {
     this.state.terrainPosition = new ArraySchema(...game.terrainPosition);
   }
 
+  // Resolves a letter's configured colour, falling back to random if the
+  // level config doesn't define one for it. Used only from the "start"
+  // handler now — see the comment there for why letters/colour aren't
+  // assigned any earlier than that.
+  resolveColour(letter) {
+    const configured = this.config.player_colours?.[letter];
+    return Array.isArray(configured) && configured.length === 3 ? configured : randomColour();
+  }
+
   onJoin(client, options) {
     if (this.state.started) {
       throw new Error("This game has already started.");
@@ -320,23 +378,23 @@ class TankRoom extends Room {
     if (this.state.isPrivate && options.code !== this.state.code) {
       throw new Error("This lobby is private. Ask the host for the code.");
     }
-
-    const letter = LETTERS.find((l) => !this.letterToSession.has(l));
-    if (!letter) {
+    if (this.state.players.size >= LETTERS.length) {
       throw new Error("This lobby is full.");
     }
-    this.sessionToLetter.set(client.sessionId, letter);
-    this.letterToSession.set(letter, client.sessionId);
 
-    const configuredColour = this.config.player_colours?.[letter];
-    const colour = Array.isArray(configuredColour) && configuredColour.length === 3
-      ? configuredColour
-      : randomColour();
-
+    // Letter (and the colour that comes with it) is deliberately NOT
+    // assigned here. Nothing in the lobby UI ever reads Player.letter or
+    // Player.color — the client only reads .letter off TankState, which
+    // doesn't exist until the game starts. Assigning at join time meant a
+    // freed letter (someone left) just sat there for whoever joined next
+    // to claim, in LETTERS order — which could hand a rejoining player
+    // their old letter back out of their new join position, or need a
+    // full re-letter pass on every leave to stay contiguous. Deferring the
+    // whole thing to "start" (see that handler) sidesteps all of it: by
+    // then the room's final seat order is exactly this.state.players'
+    // join order, computed fresh, once, with nothing to keep in sync.
     const player = new Player();
     player.nickname = (options.nickname || "Player").slice(0, 16);
-    player.letter = letter;
-    player.color = colour.join(",");
     player.isOwner = this.state.players.size === 0;
     player.ready = true;
     player.connected = true;
@@ -350,24 +408,52 @@ class TankRoom extends Room {
     const player = this.state.players.get(client.sessionId);
     if (!player) return;
 
-    // Only an explicit kick skips the reconnection grace period. We do NOT
-    // trust the `consented` flag alone here: navigating from play/index.html
-    // to game/index.html via window.location.href can make the browser send
-    // a "going away" close that Colyseus classifies as consented, which
-    // used to skip allowReconnection() entirely — so game/index.html's very
-    // first reconnect() attempt always failed with "token invalid or
-    // expired," because no reconnection was ever actually granted.
-    if (this.kickedSessionIds.has(client.sessionId)) {
-      this.kickedSessionIds.delete(client.sessionId);
+    // Only an explicit kick/leave skips the reconnection grace period. We do
+    // NOT trust the `consented` flag alone here: navigating from
+    // play/index.html to game/index.html via window.location.href can make
+    // the browser send a "going away" close that Colyseus classifies as
+    // consented, which used to skip allowReconnection() entirely — so
+    // game/index.html's very first reconnect() attempt always failed with
+    // "token invalid or expired," because no reconnection was ever actually
+    // granted. "leaveLobby" (sent by Leave/Back/Close-lobby-triggered leaves,
+    // client-side) is the one reliable signal that this is intentional.
+    if (this.noReconnectSessionIds.has(client.sessionId)) {
+      this.noReconnectSessionIds.delete(client.sessionId);
       this.removePlayer(client);
       return;
     }
 
+    // Every player — owner or guest, lobby or in-game — gets the same short
+    // reconnection grace on an unintentional drop (refresh, flaky wifi, tab
+    // close without an explicit Leave/Back). What happens if they *don't*
+    // come back in time differs by role below, not whether they get a grace
+    // period at all: a guest refreshing shouldn't behave any differently
+    // from the owner refreshing, from the guest's own point of view.
+    const wasOwner = player.isOwner;
     player.connected = false;
+
+    // Only the OWNER's absence takes the room off the public list and
+    // blocks new joins while we wait for them — this is what keeps a
+    // half-second owner refresh from ever being visible to anyone else. A
+    // guest going quiet does NOT lock the room: the lobby still has a live
+    // owner running it, so it stays fully joinable and functional the whole
+    // time a guest is mid-reconnect. (Only relevant pre-start — a started
+    // game was never in the public list to begin with.)
+    const holdsLobbyLock = wasOwner && !this.state.started;
+    if (holdsLobbyLock) this.lock();
+
+    const graceSeconds = this.state.started ? 15 : LOBBY_RECONNECT_GRACE_SECONDS;
+
     try {
-      await this.allowReconnection(client, 15);
+      await this.allowReconnection(client, graceSeconds);
       player.connected = true;
+      if (holdsLobbyLock) this.unlock();
     } catch (e) {
+      // Owner never came back in time — unlock unconditionally before
+      // handing off, so the lock never outlives the reconnection attempt
+      // it existed for. removePlayer() below reassigns ownership to the
+      // next connected player using the existing reassignment logic.
+      if (holdsLobbyLock) this.unlock();
       this.removePlayer(client);
     }
   }
@@ -394,22 +480,25 @@ class TankRoom extends Room {
     this.state.players.delete(client.sessionId);
     this.state.tanks.delete(client.sessionId);
 
-    // Only free the letter for reuse pre-game — once started, the
-    // sessionId<->letter mapping is load-bearing for the rest of the game
-    // (turn resolution, scoring by letter, etc.) and must never change.
-    if (!this.state.started) {
-      const letter = this.sessionToLetter.get(client.sessionId);
-      if (letter) {
-        this.sessionToLetter.delete(client.sessionId);
-        this.letterToSession.delete(letter);
-      }
-    }
+    // No letter bookkeeping needed here pre-game — letters aren't assigned
+    // until "start" (see onJoin's comment), so there's nothing to free or
+    // re-letter on a pre-game leave. Post-game, sessionToLetter is left
+    // exactly as-is: once started, the mapping is load-bearing for the
+    // rest of the match (turn resolution, scoring by letter, etc.) and
+    // must never change.
 
     if (player.isOwner) {
-      const nextSessionId = [...this.state.players.keys()][0];
-      if (nextSessionId) {
-        this.state.players.get(nextSessionId).isOwner = true;
-        this.state.ownerNickname = this.state.players.get(nextSessionId).nickname;
+      // Prefer a still-connected guest — with lobby reconnection grace now
+      // in play, the "first" remaining player (Map insertion order) could
+      // itself be mid-reconnect. Falling back to the first entry regardless
+      // keeps a single guaranteed owner even in the unlikely case everyone
+      // left is momentarily disconnected.
+      const entries = [...this.state.players.entries()];
+      const nextEntry = entries.find(([, p]) => p.connected) || entries[0];
+      if (nextEntry) {
+        const [, nextPlayer] = nextEntry;
+        nextPlayer.isOwner = true;
+        this.state.ownerNickname = nextPlayer.nickname;
       }
     }
 
