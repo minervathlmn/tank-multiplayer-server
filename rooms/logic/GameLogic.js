@@ -15,6 +15,7 @@ const { Tank } = require('./Tank');
 const { createRng } = require('./Rng');
 const { findNextAlive } = require('./utils');
 const { FPS, INITIAL_PARACHUTES } = require('./constants');
+const { resolvePlayerColour } = require('./colour');
 
 class GameLogic {
   static FPS = FPS;
@@ -80,8 +81,9 @@ class GameLogic {
     this.treeImageName = levelConfig.trees ?? 'tree1.png';
 
     // foreground-colour is still a "r,g,b" string in config.json (unlike
-    // player_colours, which we converted to arrays) — no "random" option
-    // ever applies here, so this simple inline parse is unchanged.
+    // player_colours, which is now { rgb: [r,g,b], name } per letter) —
+    // no "random" option ever applies here, so this simple inline parse
+    // is unchanged.
     const colourParts = (levelConfig['foreground-colour'] ?? '0,0,0').split(',').map(Number);
     this.terrainColour = colourParts.length === 3 ? colourParts : [0, 0, 0];
 
@@ -94,10 +96,10 @@ class GameLogic {
 
       const tank = new Tank(start.id, start.x, start.y, this);
 
-      // config.player_colours is now [r,g,b] arrays; Tank.setColour()
-      // falls back to a random colour for any letter with no entry.
-      const playerColourValue = this.config.player_colours?.[start.id];
-      tank.setColour(playerColourValue);
+      // Colour resolution (config lookup + random fallback for an
+      // unconfigured letter) lives in colour.js now — shared with
+      // TankRoom's own lobby-facing colour assignment.
+      tank.setColour(resolvePlayerColour(this.config, start.id));
 
       this.players.set(start.id, tank);
     }

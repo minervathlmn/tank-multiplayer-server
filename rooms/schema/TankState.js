@@ -14,6 +14,8 @@ class TankState extends Schema {
     super();
 
     this.letter = "";     // 'A'..'D' — matches GameLogic.playerIDs / TurnManager.letterOrder
+    this.nickname = "";   // copied once from Player.nickname at "start" — same value, just denormalized
+                           // onto TankState so HUD/turn-banner code only needs this one object
     this.x = 0;
     this.y = 0;
 
@@ -32,9 +34,14 @@ class TankState extends Schema {
     this.colourR = 0;
     this.colourG = 0;
     this.colourB = 0;
+    this.colourName = "";  // e.g. "Red" — looked up from config.json's
+                            // player_colours by the actual RGB TankRoom
+                            // synced above, not re-resolved independently,
+                            // so it can't drift out of sync with colourR/G/B
   }
 }
 type("string")(TankState.prototype, "letter");
+type("string")(TankState.prototype, "nickname");
 type("number")(TankState.prototype, "x");
 type("number")(TankState.prototype, "y");
 type("number")(TankState.prototype, "health");
@@ -48,5 +55,6 @@ type("boolean")(TankState.prototype, "alive");
 type("uint8")(TankState.prototype, "colourR");
 type("uint8")(TankState.prototype, "colourG");
 type("uint8")(TankState.prototype, "colourB");
+type("string")(TankState.prototype, "colourName");
 
 module.exports = { TankState };

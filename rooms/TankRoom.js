@@ -13,7 +13,10 @@ const { ArraySchema } = require('@colyseus/schema');
 const { TankRoomState, Player } = require('./schema/TankRoomState');
 const { TankState } = require('./schema/TankState');
 const { GameLogic } = require('./logic/GameLogic');
-const { randomColour } = require('./logic/colour');
+const { resolvePlayerColour, buildColourNameLookup } = require('./logic/colour');
+const { Board } = require('./logic/Board');
+const { radians, sin, cos } = require('./logic/mathUtils');
+const { Explosion } = require('./logic/Explosion');
 
 // Board letters assigned by join order, locked in once at "start" — room
 // creator is always 'A', next joiner 'B', etc., based on join order at
@@ -42,6 +45,27 @@ function generateCode() {
 // reconnecting, so err short rather than long.
 const LOBBY_RECONNECT_GRACE_SECONDS = 4;
 
+// How long to hold the previous round's synced state before broadcasting
+// the next round's terrain/background, once a level switch happens
+// mid-tick. The fatal shot's own flight doesn't need accounting for here:
+// GameLogic.Projectile ticks once per real simulation frame (see
+// setSimulationInterval below), so by the time a level switch is even
+// detected, that flight has already taken exactly as long in wall-clock
+// time as the client's own local replay of it (same physics, same FPS).
+// What's NOT accounted for anywhere else is the explosion's own
+// post-landing blast animation, which is purely visual/client-side — so
+// derive its real duration from Explosion's actual tick-cycle length
+// rather than guessing a number of ms.
+const EXPLOSION_ANIMATION_MS = Math.ceil((Explosion.ANIMATION_TICKS / GameLogic.FPS) * 1000);
+
+// Small, explicitly-separate safety margin — NOT part of the "real"
+// duration above — to absorb the shotFired/tankExploded network hop and
+// the odd dropped client frame. Safe to shrink/remove if it ever proves
+// unnecessary; it's not standing in for any actual animation length.
+const LEVEL_TRANSITION_SAFETY_MS = 150;
+
+const LEVEL_TRANSITION_DELAY_MS = EXPLOSION_ANIMATION_MS + LEVEL_TRANSITION_SAFETY_MS;
+
 function loadLevels() {
   const levelsDir = path.join(__dirname, '../levels');
   const config = JSON.parse(fs.readFileSync(path.join(levelsDir, 'config.json'), 'utf-8'));
@@ -64,11 +88,19 @@ class TankRoom extends Room {
     const { config, levelLayouts } = loadLevels();
     this.config = config;
     this.levelLayouts = levelLayouts;
+    this.colourNames = buildColourNameLookup(config);
 
     this.game = null;             // GameLogic instance, created at "start"
     this.sessionToLetter = new Map(); // populated once, at "start" — see onJoin's comment
     this.letterToSession = new Map();
     this.noReconnectSessionIds = new Set(); // explicit kicks/leaves — onLeave skips reconnection grace for these
+
+    // Set while we're deliberately holding back a level-switch sync so the
+    // last shot's flight + explosion can finish animating on clients before
+    // the terrain/background swap to the next round. See update()'s
+    // currentLevel check for why this is needed.
+    this.levelTransitionPending = false;
+    this.levelTransitionTimeout = null;
 
     const isPrivate = !!options.isPrivate;
     const ownerNickname = (options.nickname || "Player").slice(0, 16);
@@ -176,7 +208,7 @@ class TankRoom extends Room {
 
         const seatedPlayer = this.state.players.get(sessionId);
         seatedPlayer.letter = letter;
-        seatedPlayer.color = this.resolveColour(letter).join(",");
+        seatedPlayer.color = resolvePlayerColour(this.config, letter).join(",");
       });
 
       const activeLetters = sessionIds.map((id) => this.sessionToLetter.get(id));
@@ -196,10 +228,13 @@ class TankRoom extends Room {
       }
 
       this.state.started = true;
+      this.lock(); // remove from public listing — onJoin already rejects late joiners,
+                    // but without this a started game still shows up in "Join Others"
 
       for (const sessionId of sessionIds) {
         const tankState = new TankState();
         tankState.letter = this.sessionToLetter.get(sessionId);
+        tankState.nickname = this.state.players.get(sessionId)?.nickname || `Player ${tankState.letter}`;
         this.state.tanks.set(sessionId, tankState);
       }
 
@@ -242,6 +277,17 @@ class TankRoom extends Room {
         });
 
         this.game.playerOrder(); // confirmed from sketch.js: turn passes immediately on fire
+
+        // Sync the new turn holder right now rather than waiting for the
+        // next simulation tick's update() to do it. Without this, a second
+        // "action" message arriving before the next tick (e.g. a fast
+        // double-tap of fire) would still pass the
+        // `client.sessionId !== this.state.currentTurnSessionId` check
+        // above against the stale, pre-turn-pass value — letting the same
+        // client fire twice and call playerOrder() an extra time, which
+        // (with 2 players) flips the turn forward and immediately back,
+        // leaving currentPlayer/currentTurnSessionId desynced.
+        this.state.currentTurnSessionId = this.letterToSession.get(this.game.currentPlayer) ?? "";
       } else if (type === "xtra") {
         tank.projectile.xtra(tank);
       } else {
@@ -251,6 +297,13 @@ class TankRoom extends Room {
 
     this.onMessage("restart", (client) => {
       if (!this.state.started || !this.game) return;
+
+      if (this.levelTransitionTimeout) {
+        this.levelTransitionTimeout.clear();
+        this.levelTransitionTimeout = null;
+      }
+      this.levelTransitionPending = false;
+
       this.game.restartGame();
       this.syncFullState();
       this.broadcast("restart");
@@ -298,10 +351,11 @@ class TankRoom extends Room {
     tankState.falling = tank.falling;
     tankState.alive = game.remainingTanks.includes(tank.player);
     [tankState.colourR, tankState.colourG, tankState.colourB] = tank.colour;
+    tankState.colourName = this.colourNames[tank.colour.join(",")] || "Player";
   }
 
   update(dt) {
-    if (!this.game) return;
+    if (!this.game || this.levelTransitionPending) return;
     const game = this.game;
     const levelBefore = game.currentLevel;
 
@@ -332,16 +386,30 @@ class TankRoom extends Room {
       // it for the client's blast animation — reusing whatever x/y/radius
       // setExplosionForTank() already set on this tank's own explosion
       // object, rather than recomputing anything.
-      if (!game.remainingTanks.includes(letter)) {
+      if (tank.health <= 0 || !game.remainingTanks.includes(letter)) {
         const exp = tank.projectile.explosion;
         this.broadcast("tankExploded", { x: exp.x, y: exp.y, radius: exp.radius });
       }
     }
 
-    // A level switch rebuilds board + all Tank instances inside GameLogic —
-    // re-sync everything rather than trying to patch the diff.
+    // A level switch rebuilds board + all Tank instances inside GameLogic,
+    // synchronously, as part of the tick above — by this point game.terrain/
+    // game.players already belong to the NEXT round. But every client is
+    // still mid-animation for the tankExploded broadcast sent above, and/or
+    // still replaying the fatal shot's own flight locally (CosmeticProjectile
+    // reads state.terrainPosition live every frame — see sketch.js's
+    // drawShots()). Broadcasting the next round's terrain/background right
+    // now would swap the ground out from under both mid-animation. Leave
+    // state exactly as the previous, still-synced tick left it (last round's
+    // terrain, tank positions/health) for a buffer, then flip everyone to
+    // the next round all at once.
     if (game.currentLevel !== levelBefore) {
-      this.syncFullState();
+      this.levelTransitionPending = true;
+      this.levelTransitionTimeout = this.clock.setTimeout(() => {
+        this.levelTransitionPending = false;
+        this.levelTransitionTimeout = null;
+        this.syncFullState();
+      }, LEVEL_TRANSITION_DELAY_MS);
       return;
     }
 
@@ -360,15 +428,6 @@ class TankRoom extends Room {
     // regardless (Colyseus only sends the actual diffed indices over the
     // wire), simpler and safer than trying to detect "did it change".
     this.state.terrainPosition = new ArraySchema(...game.terrainPosition);
-  }
-
-  // Resolves a letter's configured colour, falling back to random if the
-  // level config doesn't define one for it. Used only from the "start"
-  // handler now — see the comment there for why letters/colour aren't
-  // assigned any earlier than that.
-  resolveColour(letter) {
-    const configured = this.config.player_colours?.[letter];
-    return Array.isArray(configured) && configured.length === 3 ? configured : randomColour();
   }
 
   onJoin(client, options) {
