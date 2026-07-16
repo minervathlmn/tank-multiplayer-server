@@ -43,7 +43,7 @@ function generateCode() {
 // real connection drop. Every second here is also a second the owner's
 // room may sit locked out of the public list/new joins if it's the owner
 // reconnecting, so err short rather than long.
-const LOBBY_RECONNECT_GRACE_SECONDS = 4;
+const LOBBY_RECONNECT_GRACE_SECONDS = 15;
 
 // How long to hold the previous round's synced state before broadcasting
 // the next round's terrain/background, once a level switch happens
