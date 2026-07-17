@@ -8,7 +8,7 @@ const { Board } = require('./Board');
 const { Explosion } = require('./Explosion');
 const { clamp } = require('./utils');
 const { radians, sin, cos } = require('./mathUtils');
-const { FPS } = require('./constants');
+const { FPS, GRAVITY, WIND_SCALE, DRAG_COEFF } = require('./constants');
 
 class Projectile {
   constructor() {
@@ -24,7 +24,7 @@ class Projectile {
     this.velX = 0;
     this.velY = 0;
 
-    this.normal = true; // false while the "xtra" power-up is active
+    this.normal_size = true; // false while the "xtra" power-up is active
     this.colour = [0, 0, 0];
   }
 
@@ -37,7 +37,7 @@ class Projectile {
     const cost = 20;
     if (tank.score >= cost) {
       tank.addScore(-cost);
-      this.normal = false;
+      this.normal_size = false;
     }
   }
 
@@ -69,7 +69,7 @@ class Projectile {
       this.velX = 0;
       this.velY = 0;
 
-      if (!this.normal) {
+      if (!this.normal_size) {
         this.explosion.setExplosionForXtra(this);
       } else {
         this.explosion.setExplosionForProjectile(this);
@@ -80,15 +80,27 @@ class Projectile {
 
       this.x = -50;
       this.y = -50;
-      this.normal = true;
+      this.normal_size = true;
     } else if (this.x <= 5 || this.y <= 5 || this.x >= Board.WIDTH - 5 || this.y >= Board.HEIGHT - 5) {
       // out of screen
       this.x = -50;
       this.y = -50;
     } else {
-      this.x += this.velX + (game.wind * 0.03) / FPS; // wind: w*0.03 px/sec
+      // VERSION 1
+      // this.x += this.velX + (game.wind * 0.03) / FPS; // wind: w*0.03 px/sec
+      // this.y -= this.velY;
+      // this.velY -= GRAVITY / FPS;
+
+      // // VERSION 2
+      // this.velX += (game.wind * someAccelConstant) / FPS; // wind as acceleration, like gravity
+      // this.x += this.velX;
+
+      // // VERSION 3
+      const windTargetVelX = game.wind * WIND_SCALE;
+      this.velX += (DRAG_COEFF * (windTargetVelX - this.velX)) / FPS;  // drag pulls velX toward wind
+      this.x += this.velX;                                             // no more separate wind term here
       this.y -= this.velY;
-      this.velY -= 3.6 / FPS; // gravity: 3.6 px/sec^2
+      this.velY -= GRAVITY / FPS;
     }
   }
 }

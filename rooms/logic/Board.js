@@ -4,13 +4,14 @@
 // require()'d here instead of assumed as a browser global.
 
 const { Cell } = require('./Cell');
+const { CELLSIZE, WIDTH, HEIGHT, GRID_WIDTH, GRID_HEIGHT } = require('./constants');
 
 class Board {
-  static CELLSIZE = 32;
-  static WIDTH = 864;
-  static HEIGHT = 640;
-  static GRID_WIDTH = Math.floor(Board.WIDTH / Board.CELLSIZE) + 1; // 28
-  static GRID_HEIGHT = 20;
+  static CELLSIZE = CELLSIZE;
+  static WIDTH = WIDTH;
+  static HEIGHT = HEIGHT;
+  static GRID_WIDTH = GRID_WIDTH;
+  static GRID_HEIGHT = GRID_HEIGHT;
 
   constructor() {
     this.cells = [];

@@ -9,11 +9,11 @@ const { Board } = require('./Board');
 const { Projectile } = require('./Projectile');
 const { clamp } = require('./utils');
 const { radians, sin, cos } = require('./mathUtils');
-const { INITIAL_PARACHUTES } = require('./constants');
+const { INITIAL_PARACHUTES , TURRET_LENGTH} = require('./constants');
 const { randomColour } = require('./colour');
 
 class Tank {
-  static TURRET_LENGTH = 15;
+  static TURRET_LENGTH = TURRET_LENGTH;
 
   constructor(playerId, x, y, game) {
     this.player = playerId;

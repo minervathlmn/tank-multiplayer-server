@@ -10,9 +10,10 @@
 // broadcast of where/how big the blast was.
 
 const { Board } = require('./Board');
+const { ANIMATION_TICKS } = require('./constants');
 
 class Explosion {
-  static ANIMATION_TICKS = 6;
+  static ANIMATION_TICKS = ANIMATION_TICKS;
 
   constructor() {
     this.x = -50;
