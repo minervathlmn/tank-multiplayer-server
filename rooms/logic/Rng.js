@@ -1,10 +1,3 @@
-// rooms/logic/Rng.js
-// Verbatim port of client Rng.js — deterministic PRNG (mulberry32).
-// Server is now the sole source of "random" (wind), so this seed only
-// ever needs to be generated once here and never sent anywhere except
-// as a broadcast for clients to replay any *cosmetic* randomness they
-// might still want locally (none currently, but kept for parity).
-
 function createRng(seed) {
   let s = seed >>> 0;
   return function () {
@@ -15,4 +8,7 @@ function createRng(seed) {
   };
 }
 
-module.exports = { createRng };
+// Node sees `module`, browser <script> tag doesn't
+if (typeof module !== 'undefined' && module.exports) {
+  module.exports = { createRng };
+}

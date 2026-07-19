@@ -16,9 +16,8 @@
 // Aiming quality is controlled entirely by DIFFICULTY_PRESETS below.
 
 const { Board } = require('./Board');
-const { clamp } = require('./utils');
-const { radians, sin, cos } = require('./mathUtils');
-const { FPS, GRAVITY, WIND_SCALE, DRAG_COEFF, TURRET_LENGTH } = require('./constants');
+const { clamp, radians, sin, cos } = require('./utils');
+const { FPS, GRAVITY, WIND_SCALE, DRAG_COEFF, TURRET_LENGTH } = require('../../shared/constants');
 
 // Must stay numerically in sync with Projectile.js's tick() — this is a
 // headless re-implementation of the same physics so we can "test-fire"

@@ -1,33 +1,54 @@
 // rooms/logic/utils.js
-// Server-side utils.js.
-// - clamp() -> needed by Tank/Projectile terrain-array bounds checks
-// - findNextAlive() -> needed directly by GameLogic.playerOrder(), now
-//   that GameLogic is the sole turn-order authority server-side
-//   (previously assumed superseded by TurnManager.advance() — that
-//   reasoning no longer applies since TurnManager was removed)
-// - parseColourString()/randomColour() -> not needed here; colour
-//   resolution lives in colour.js (randomColour) since config.player_colours
-//   is now [r,g,b] arrays directly, no string parsing required
-// - loadSpriteSafe() -> p5-only (uses loadImage), never applicable server-side
 
+// Shared by Tank/Projectile/Bot for terrain-array bounds checks
 function clamp(value, min, max) {
   return Math.max(min, Math.min(max, value));
 }
 
-// Shared by GameLogic.playerOrder(). Finds the next id in playerIDs,
-// starting at fromIndex, that's still in remainingTanks. Returns
-// { id, index } so callers can decide what to mutate with the index.
-function findNextAlive(playerIDs, remainingTanks, fromIndex) {
-  let idx = fromIndex;
-  let guard = 0; // safety net against an all-dead edge case looping forever
-  while (guard++ < 1000) {
-    const candidate = playerIDs[idx % playerIDs.length];
-    if (remainingTanks.includes(candidate)) {
-      return { id: candidate, index: idx };
-    }
-    idx++;
-  }
-  return { id: playerIDs[fromIndex % playerIDs.length], index: fromIndex };
+
+// p5 injects radians()/degrees()/sin()/cos() as globals in the browser.
+// The server has no p5 instance, so these are the plain-JS equivalents —
+// identical math, just imported instead of ambient.
+function radians(deg) { return (deg * Math.PI) / 180; }
+function degrees(rad) { return (rad * 180) / Math.PI; }
+function sin(rad) { return Math.sin(rad); }
+function cos(rad) { return Math.cos(rad); }
+
+
+function randomColour() {
+  return [
+    Math.floor(Math.random() * 256),
+    Math.floor(Math.random() * 256),
+    Math.floor(Math.random() * 256),
+  ];
 }
 
-module.exports = { clamp, findNextAlive };
+// Single place that knows the shape of config.json's player_colours
+// entries ({ rgb: [r,g,b], name } per letter) — resolves a letter's
+// configured colour, falling back to a random one if the level layout
+// defines a letter with no config entry (e.g. a 4-player layout used
+// with only 2 joined). Used by GameLogic (assigning each Tank's real
+// colour) and TankRoom (assigning the lobby-facing Player.color string
+// before GameLogic even exists yet) — both need the exact same
+// resolution, previously duplicated between them.
+function resolvePlayerColour(config, letter) {
+  const configured = config?.player_colours?.[letter];
+  return Array.isArray(configured?.rgb) && configured.rgb.length === 3
+    ? configured.rgb
+    : randomColour();
+}
+
+// Builds an "r,g,b" -> name lookup from config.player_colours, so a
+// tank's colour name can be read back out however its RGB was actually
+// resolved above (configured, or the randomColour() fallback).
+function buildColourNameLookup(config) {
+  const lookup = {};
+  for (const entry of Object.values(config?.player_colours || {})) {
+    if (entry && Array.isArray(entry.rgb) && entry.rgb.length === 3 && entry.name) {
+      lookup[entry.rgb.join(",")] = entry.name;
+    }
+  }
+  return lookup;
+}
+
+module.exports = { clamp, radians, degrees, sin, cos, randomColour, resolvePlayerColour, buildColourNameLookup };

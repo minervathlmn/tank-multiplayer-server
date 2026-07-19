@@ -6,9 +6,8 @@
 
 const { Board } = require('./Board');
 const { Explosion } = require('./Explosion');
-const { clamp } = require('./utils');
-const { radians, sin, cos } = require('./mathUtils');
-const { FPS, GRAVITY, WIND_SCALE, DRAG_COEFF } = require('./constants');
+const { clamp, radians, sin, cos } = require('./utils');
+const { FPS, GRAVITY, WIND_SCALE, DRAG_COEFF } = require('../../shared/constants');
 
 class Projectile {
   constructor() {

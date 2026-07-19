@@ -6,12 +6,13 @@
   "type": "commonjs",
   "scripts": {
     "start": "node index.js",
-    "dev": "nodemon index.js"
+    "dev": "nodemon index.js",
+    "sync-client": "node scripts/sync-shared.js"
   },
   "dependencies": {
     "@colyseus/core": "^0.16.24",
-    "@colyseus/redis-driver": "^0.16.1",
-    "@colyseus/redis-presence": "^0.16.4",
+    // "@colyseus/redis-driver": "^0.16.1",
+    // "@colyseus/redis-presence": "^0.16.4",
     "@colyseus/schema": "^3.0.76",
     "@colyseus/tools": "^0.16.20",
     "@colyseus/ws-transport": "^0.16.5",

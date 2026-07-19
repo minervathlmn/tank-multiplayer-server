@@ -13,18 +13,32 @@ const { ArraySchema } = require('@colyseus/schema');
 const { TankRoomState, Player } = require('./schema/TankRoomState');
 const { TankState } = require('./schema/TankState');
 const { GameLogic } = require('./logic/GameLogic');
-const { resolvePlayerColour, buildColourNameLookup } = require('./logic/colour');
 const { Board } = require('./logic/Board');
-const { radians, sin, cos } = require('./logic/mathUtils');
+const { radians, sin, cos, resolvePlayerColour, buildColourNameLookup } = require('./logic/utils');
 const { Explosion } = require('./logic/Explosion');
+const { Bot } = require('./logic/Bot');
 
 // Board letters assigned by join order, locked in once at "start" — room
 // creator is always 'A', next joiner 'B', etc., based on join order at
 // that moment (see the "start" handler and onJoin's comment for why).
+// Any letters left over after real players are seated are filled with
+// Bots (see "start"), so a started game always fields all four tanks.
 // This assumes every level layout defines start positions for these exact
 // letters; if a layout ever doesn't, "start" fails loudly (see below)
 // rather than silently spawning a mismatched or missing tank.
 const LETTERS = ["A", "B", "C", "D"];
+
+// Bots don't have a real Colyseus sessionId, but every place that keys off
+// "whose turn/tank is this" (sessionToLetter, letterToSession, state.tanks,
+// currentTurnSessionId) is written generically around "some id string that
+// identifies a seat" — so bots get a synthetic id in that same shape rather
+// than a parallel bot-specific set of maps. No real client.sessionId can
+// ever collide with this, which is also what naturally keeps human "action"
+// messages from being accepted during a bot's turn (see the "action"
+// handler's currentTurnSessionId check) with no extra bot-aware guard needed.
+function botSeatId(letter) {
+  return `bot:${letter}`;
+}
 
 const TURN_ACTIONS = new Set([
   "rotateLeft", "rotateRight", "moveLeft", "moveRight",
@@ -92,8 +106,15 @@ class TankRoom extends Room {
 
     this.game = null;             // GameLogic instance, created at "start"
     this.sessionToLetter = new Map(); // populated once, at "start" — see onJoin's comment
-    this.letterToSession = new Map();
+    this.letterToSession = new Map(); // human sessionIds AND bot synthetic ids (see botSeatId)
     this.noReconnectSessionIds = new Set(); // explicit kicks/leaves — onLeave skips reconnection grace for these
+
+    this.bots = new Map();        // letter -> Bot instance, only for AI-filled seats, populated at "start"
+    this.activeBotLetter = null;  // letter whose Bot.startTurn() has already run this turn; reset whenever
+                                   // currentPlayer changes (fire, disconnect-elimination, restart) so the
+                                   // next bot turn (if any) gets a fresh startTurn() call
+    const validDifficulties = ["easy", "medium", "hard", "expert"];
+    this.botDifficulty = validDifficulties.includes(options.botDifficulty) ? options.botDifficulty : "medium";
 
     // Set while we're deliberately holding back a level-switch sync so the
     // last shot's flight + explosion can finish animating on clients before
@@ -201,6 +222,9 @@ class TankRoom extends Room {
       // next attempt, with no stale state to clean up either way.
       this.sessionToLetter.clear();
       this.letterToSession.clear();
+      this.bots.clear();
+      this.activeBotLetter = null;
+
       sessionIds.forEach((sessionId, i) => {
         const letter = LETTERS[i];
         this.sessionToLetter.set(sessionId, letter);
@@ -211,7 +235,18 @@ class TankRoom extends Room {
         seatedPlayer.color = resolvePlayerColour(this.config, letter).join(",");
       });
 
-      const activeLetters = sessionIds.map((id) => this.sessionToLetter.get(id));
+      // Whatever letters real players didn't claim get filled with Bots —
+      // a started game always fields all four tanks. With a full human
+      // lobby this is just an empty slice and behaves exactly as before.
+      const botLetters = LETTERS.slice(sessionIds.length);
+      for (const letter of botLetters) {
+        const seatId = botSeatId(letter);
+        this.sessionToLetter.set(seatId, letter);
+        this.letterToSession.set(letter, seatId);
+        this.bots.set(letter, new Bot(letter, this.botDifficulty));
+      }
+
+      const activeLetters = LETTERS.slice(0, sessionIds.length + botLetters.length);
 
       this.game = new GameLogic(this.config, this.levelLayouts, seed, activeLetters);
 
@@ -237,6 +272,13 @@ class TankRoom extends Room {
         tankState.nickname = this.state.players.get(sessionId)?.nickname || `Player ${tankState.letter}`;
         this.state.tanks.set(sessionId, tankState);
       }
+      for (const letter of botLetters) {
+        const tankState = new TankState();
+        tankState.letter = letter;
+        tankState.nickname = `Bot (${this.botDifficulty})`;
+        tankState.isBot = true;
+        this.state.tanks.set(botSeatId(letter), tankState);
+      }
 
       this.syncFullState();
 
@@ -259,35 +301,7 @@ class TankRoom extends Room {
       if (!tank) return;
 
       if (type === "fire") {
-        tank.stopAdjustment();
-        const wasXtra = !tank.projectile.normal_size;
-        tank.projectile.setFire(this.game, tank);
-
-        // Cosmetic-only: lets clients replay the same simple trajectory
-        // locally for the shell/explosion animation. The server has
-        // already resolved the real outcome (damage, terrain) by the
-        // time this arrives — this is purely so clients see something.
-        this.broadcast("shotFired", {
-          shooterSessionId: client.sessionId,
-          startX: tank.projectile.x,
-          startY: tank.projectile.y,
-          angle: tank.projectile.angle,
-          power: tank.projectile.power,
-          wasXtra,
-        });
-
-        this.game.playerOrder(); // confirmed from sketch.js: turn passes immediately on fire
-
-        // Sync the new turn holder right now rather than waiting for the
-        // next simulation tick's update() to do it. Without this, a second
-        // "action" message arriving before the next tick (e.g. a fast
-        // double-tap of fire) would still pass the
-        // `client.sessionId !== this.state.currentTurnSessionId` check
-        // above against the stale, pre-turn-pass value — letting the same
-        // client fire twice and call playerOrder() an extra time, which
-        // (with 2 players) flips the turn forward and immediately back,
-        // leaving currentPlayer/currentTurnSessionId desynced.
-        this.state.currentTurnSessionId = this.letterToSession.get(this.game.currentPlayer) ?? "";
+        this.fireTank(letter);
       } else if (type === "xtra") {
         tank.projectile.xtra(tank);
       } else {
@@ -303,11 +317,89 @@ class TankRoom extends Room {
         this.levelTransitionTimeout = null;
       }
       this.levelTransitionPending = false;
+      this.activeBotLetter = null;
 
       this.game.restartGame();
       this.syncFullState();
       this.broadcast("restart");
     });
+  }
+
+  // Fires whichever tank holds `letter`'s turn right now and passes the
+  // turn. Shared by the human "action"/"fire" handler and updateBots() —
+  // originally this logic only lived inline in the "action" handler, but
+  // a Bot deciding to fire needs to trigger the exact same sequence with
+  // no human client or "action" message involved.
+  fireTank(letter) {
+    const tank = this.game.players.get(letter);
+    if (!tank) return;
+
+    tank.stopAdjustment();
+    const doubleBlastRadius = !tank.projectile.normal_size;
+    tank.projectile.setFire(this.game, tank);
+
+    // Cosmetic-only: lets clients replay the same simple trajectory
+    // locally for the shell/explosion animation. The server has already
+    // resolved the real outcome (damage, terrain) by the time this
+    // arrives — this is purely so clients see something. For a bot shot,
+    // shooterSessionId is the synthetic botSeatId — clients that look the
+    // shooter up in state.tanks (keyed the same way) resolve it fine with
+    // no bot-specific handling needed on their end.
+    this.broadcast("shotFired", {
+      shooterSessionId: this.letterToSession.get(letter) ?? "",
+      startX: tank.projectile.x,
+      startY: tank.projectile.y,
+      angle: tank.projectile.angle,
+      power: tank.projectile.power,
+      doubleBlastRadius,
+    });
+
+    this.game.playerOrder(); // confirmed from sketch.js: turn passes immediately on fire
+
+    // Sync the new turn holder right now rather than waiting for the next
+    // simulation tick's update() to do it. Without this, a second "action"
+    // message arriving before the next tick (e.g. a fast double-tap of
+    // fire) would still pass the `client.sessionId !==
+    // this.state.currentTurnSessionId` check above against the stale,
+    // pre-turn-pass value — letting the same client fire twice and call
+    // playerOrder() an extra time, which (with 2 players) flips the turn
+    // forward and immediately back, leaving currentPlayer/
+    // currentTurnSessionId desynced.
+    this.state.currentTurnSessionId = this.letterToSession.get(this.game.currentPlayer) ?? "";
+
+    // Whoever's turn it is now (human or bot) starts fresh — see
+    // updateBots() for why this matters even when the new turn is human.
+    this.activeBotLetter = null;
+  }
+
+  // Drives whichever Bot currently holds the turn, if any. Bots "play" by
+  // holding the same rotate/power flags a real client's "action" messages
+  // would set on their Tank (see Bot.js's own header) — Tank.tick(), called
+  // right after this in update()'s per-tank loop, is what actually turns
+  // those flags into turretAngle/power changes, exactly as it does for a
+  // human's queued input. Call this before that per-tank loop each tick so
+  // a flag a bot sets this frame gets applied within the same frame.
+  updateBots(dt) {
+    const game = this.game;
+    const letter = game.currentPlayer;
+    const bot = this.bots.get(letter);
+
+    if (!bot) {
+      // Current turn isn't a bot's — clear any stale tracking so that if
+      // play comes back around to a bot later, it gets a fresh startTurn().
+      this.activeBotLetter = null;
+      return;
+    }
+
+    if (this.activeBotLetter !== letter) {
+      bot.startTurn(game);
+      this.activeBotLetter = letter;
+    }
+
+    const shouldFire = bot.tick(game, dt);
+    if (shouldFire) {
+      this.fireTank(letter); // also clears activeBotLetter, for whoever's up next
+    }
   }
 
   // Copies everything from the plain-JS GameLogic/Tank simulation onto the
@@ -358,6 +450,8 @@ class TankRoom extends Room {
     if (!this.game || this.levelTransitionPending) return;
     const game = this.game;
     const levelBefore = game.currentLevel;
+
+    this.updateBots(dt);
 
     // Only alive tanks tick — matches original drawTanks()'s iteration
     // over [...game.remainingTanks], not all game.playerIDs.
@@ -529,7 +623,8 @@ class TankRoom extends Room {
       const letter = this.sessionToLetter.get(client.sessionId);
       const tank = letter && this.game.players.get(letter);
       if (tank && this.game.remainingTanks.includes(letter)) {
-        tank.selfDestruct(this.game, 0);
+        tank.selfDestruct(this.game, 0); // may itself advance the turn via playerOrder()
+        this.activeBotLetter = null; // whoever holds the turn now (possibly a bot) starts fresh
         const exp = tank.projectile.explosion;
         this.broadcast("tankExploded", { x: exp.x, y: exp.y, radius: exp.radius });
         this.syncFullState();

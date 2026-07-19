@@ -1,10 +1,5 @@
-// rooms/logic/Board.js
-// Port of client Board.js — no p5 dependency existed in the original, so
-// logic is unchanged. Only difference from the client version: Cell is
-// require()'d here instead of assumed as a browser global.
-
 const { Cell } = require('./Cell');
-const { CELLSIZE, WIDTH, HEIGHT, GRID_WIDTH, GRID_HEIGHT } = require('./constants');
+const { CELLSIZE, WIDTH, HEIGHT, GRID_WIDTH, GRID_HEIGHT } = require('../../shared/constants');
 
 class Board {
   static CELLSIZE = CELLSIZE;

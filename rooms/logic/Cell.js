@@ -1,6 +1,3 @@
-// rooms/logic/Cell.js
-// Verbatim port of client Cell.js — pure data class, no changes needed.
-
 class Cell {
   static Type = {
     TERRAIN: 'terrain',

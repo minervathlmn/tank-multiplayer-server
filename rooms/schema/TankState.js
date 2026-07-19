@@ -29,6 +29,7 @@ class TankState extends Schema {
 
     this.falling = false;
     this.alive = true;    // false once selfDestruct() has run for this tank
+    this.isBot = false;   // true for AI-filled seats — see TankRoom's Bot wiring
 
     // colour as three 0-255 components, matching Tank.colour ([r,g,b])
     this.colourR = 0;
@@ -52,6 +53,7 @@ type("number")(TankState.prototype, "parachute");
 type("number")(TankState.prototype, "turretAngle");
 type("boolean")(TankState.prototype, "falling");
 type("boolean")(TankState.prototype, "alive");
+type("boolean")(TankState.prototype, "isBot");
 type("uint8")(TankState.prototype, "colourR");
 type("uint8")(TankState.prototype, "colourG");
 type("uint8")(TankState.prototype, "colourB");

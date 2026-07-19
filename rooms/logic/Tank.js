@@ -7,10 +7,9 @@
 
 const { Board } = require('./Board');
 const { Projectile } = require('./Projectile');
-const { clamp } = require('./utils');
-const { radians, sin, cos } = require('./mathUtils');
-const { INITIAL_PARACHUTES , TURRET_LENGTH} = require('./constants');
-const { randomColour } = require('./colour');
+const { clamp, radians, sin, cos } = require('./utils');
+const { INITIAL_PARACHUTES , TURRET_LENGTH} = require('../../shared/constants');
+const { randomColour } = require('./utils');
 
 class Tank {
   static TURRET_LENGTH = TURRET_LENGTH;

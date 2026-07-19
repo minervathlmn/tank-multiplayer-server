@@ -1,5 +1,4 @@
-// rooms/logic/constants.js
-module.exports = {
+const Constants = {
   FPS: 30,
   INITIAL_PARACHUTES: 1,
 
@@ -17,3 +16,7 @@ module.exports = {
 
   ANIMATION_TICKS: 6
 };
+
+if (typeof module !== 'undefined' && module.exports) {
+  module.exports = Constants;
+}

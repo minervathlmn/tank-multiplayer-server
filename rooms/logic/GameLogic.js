@@ -13,9 +13,8 @@
 const { Board } = require('./Board');
 const { Tank } = require('./Tank');
 const { createRng } = require('./Rng');
-const { findNextAlive } = require('./utils');
-const { FPS, INITIAL_PARACHUTES } = require('./constants');
-const { resolvePlayerColour } = require('./colour');
+const { FPS, INITIAL_PARACHUTES } = require('../../shared/constants');
+const { resolvePlayerColour } = require('./utils');
 
 class GameLogic {
   static FPS = FPS;
@@ -167,6 +166,20 @@ class GameLogic {
   isGameOver() {
     return this.isLevelOver() && this.currentLevel === this.config.levels.length;
   }
+}
+
+// Finds the next alive player starting from fromIndex, wrapping around playerIDs.
+function findNextAlive(playerIDs, remainingTanks, fromIndex) {
+  let idx = fromIndex;
+  let guard = 0; // safety net against an all-dead edge case looping forever
+  while (guard++ < 1000) {
+    const candidate = playerIDs[idx % playerIDs.length];
+    if (remainingTanks.includes(candidate)) {
+      return { id: candidate, index: idx };
+    }
+    idx++;
+  }
+  return { id: playerIDs[fromIndex % playerIDs.length], index: fromIndex };
 }
 
 module.exports = { GameLogic };
