@@ -1,4 +1,9 @@
 // app.config.js
+//
+// Colyseus framework config: registers TankRoom under its room-type name
+// and sets up the Express app (CORS, static files, etc.) that sits
+// alongside the game server. Depends on colyseus and TankRoom.
+
 const { matchMaker } = require("colyseus");
 const { TankRoom } = require("./rooms/TankRoom");
 

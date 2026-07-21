@@ -23,11 +23,13 @@
     "B": { "rgb": [0, 255, 0], "name": "Green" },
     "C": { "rgb": [0, 0, 255], "name": "Blue" },
     "D": { "rgb": [255, 255, 0], "name": "Yellow" },
+
     "E": { "rgb": [255, 0, 255], "name": "Magenta" },
     "F": { "rgb": [0, 255, 255], "name": "Cyan" },
-    "0": { "rgb": [73, 73, 73], "name": "Dark Grey" },
-    "1": { "rgb": [109, 109, 109], "name": "Grey" },
-    "2": { "rgb": [146, 146, 146], "name": "Light Grey" },
-    "3": { "rgb": [182, 182, 182], "name": "Pale Grey" }
+    
+    "1": { "rgb": [73, 73, 73], "name": "Dark Grey" },
+    "2": { "rgb": [109, 109, 109], "name": "Grey" },
+    "3": { "rgb": [146, 146, 146], "name": "Light Grey" },
+    "4": { "rgb": [182, 182, 182], "name": "Pale Grey" }
   }
 }

@@ -10,34 +10,50 @@ const fs = require('fs');
 const path = require('path');
 const { Room } = require('colyseus');
 const { ArraySchema } = require('@colyseus/schema');
-const { TankRoomState, Player } = require('./schema/TankRoomState');
-const { TankState } = require('./schema/TankState');
-const { GameLogic } = require('./logic/GameLogic');
-const { Board } = require('./logic/Board');
+const { MAX_PLAYERS } = require('../shared/constants');
 const { radians, sin, cos, resolvePlayerColour, buildColourNameLookup } = require('./logic/utils');
+const { Board } = require('./logic/Board');
 const { Explosion } = require('./logic/Explosion');
+const { GameLogic } = require('./logic/GameLogic');
 const { Bot } = require('./logic/Bot');
+const { TankState } = require('./schema/TankState');
+const { TankRoomState, Player } = require('./schema/TankRoomState');
 
-// Board letters assigned by join order, locked in once at "start" — room
-// creator is always 'A', next joiner 'B', etc., based on join order at
-// that moment (see the "start" handler and onJoin's comment for why).
-// Any letters left over after real players are seated are filled with
-// Bots (see "start"), so a started game always fields all four tanks.
+// Single source of truth for room capacity. Bump this to raise or lower
+// the player cap — LETTERS below and Room.maxClients (see onCreate) both
+// derive from it, so nothing else needs to change to add/remove seats.
+// Caps out at 26 (Z) since letters are generated via charCode arithmetic;
+// a design wanting more than 26 seats would need a different labeling
+// scheme entirely, not just a bigger number here.
+// const MAX_PLAYERS = 4;
+
+// Board letters assigned by join/add order, locked in once at "start" —
+// room creator is always 'A', next seat 'B', etc., based on this.state.players'
+// order at that moment (see the "start" handler and onJoin's comment for why).
+// Bots are opt-in, not automatic (see "addBot"): a started game fields
+// exactly as many tanks as there are occupied seats — human or bot — which
+// may be fewer than MAX_PLAYERS.
 // This assumes every level layout defines start positions for these exact
 // letters; if a layout ever doesn't, "start" fails loudly (see below)
 // rather than silently spawning a mismatched or missing tank.
-const LETTERS = ["A", "B", "C", "D"];
+const LETTERS = Array.from({ length: MAX_PLAYERS }, (_, i) => String.fromCharCode(65 + i));
 
 // Bots don't have a real Colyseus sessionId, but every place that keys off
 // "whose turn/tank is this" (sessionToLetter, letterToSession, state.tanks,
-// currentTurnSessionId) is written generically around "some id string that
-// identifies a seat" — so bots get a synthetic id in that same shape rather
-// than a parallel bot-specific set of maps. No real client.sessionId can
-// ever collide with this, which is also what naturally keeps human "action"
-// messages from being accepted during a bot's turn (see the "action"
-// handler's currentTurnSessionId check) with no extra bot-aware guard needed.
-function botSeatId(letter) {
-  return `bot:${letter}`;
+// state.players, currentTurnSessionId) is written generically around "some
+// id string that identifies a seat" — so bots get a synthetic id in that
+// same shape rather than a parallel bot-specific set of maps. No real
+// client.sessionId can ever collide with this, which is also what
+// naturally keeps human "action" messages from being accepted during a
+// bot's turn (see the "action" handler's currentTurnSessionId check) with
+// no extra bot-aware guard needed.
+//
+// The id is assigned once, at "addBot" time (see onCreate), from a
+// room-scoped sequence counter — not derived from the bot's eventual board
+// letter, since bots now exist as lobby seats before any letter is
+// assigned (letters are only handed out at "start", same as for humans).
+function botSeatId(seq) {
+  return `bot:${seq}`;
 }
 
 const TURN_ACTIONS = new Set([
@@ -81,7 +97,7 @@ const LEVEL_TRANSITION_SAFETY_MS = 150;
 const LEVEL_TRANSITION_DELAY_MS = EXPLOSION_ANIMATION_MS + LEVEL_TRANSITION_SAFETY_MS;
 
 function loadLevels() {
-  const levelsDir = path.join(__dirname, '../levels');
+  const levelsDir = path.join(__dirname, '../shared/levels');
   const config = JSON.parse(fs.readFileSync(path.join(levelsDir, 'config.json'), 'utf-8'));
 
   const levelLayouts = {};
@@ -93,9 +109,26 @@ function loadLevels() {
   return { config, levelLayouts };
 }
 
+/**
+ * One instance of this = one lobby/game (see file header for the overall
+ * server-authoritative model). Owns the Colyseus room lifecycle (join/
+ * leave/reconnect), the lobby-to-game transition ("start"), routing
+ * player input into GameLogic, and syncing GameLogic's plain-JS
+ * simulation state onto the networked TankRoomState schema every tick.
+ */
 class TankRoom extends Room {
-  maxClients = 4;
+  maxClients = MAX_PLAYERS;
 
+  /**
+   * Colyseus lifecycle hook: room instance created. Loads level config,
+   * initializes lobby/game bookkeeping (all still empty — no game exists
+   * until "start"), and registers every message handler for the lifetime
+   * of this room.
+   *
+   * @param {object} options - Room creation options from the client that
+   *   created it: { isPrivate, nickname, botDifficulty }.
+   * @returns {void}
+   */
   onCreate(options) {
     this.setState(new TankRoomState());
 
@@ -113,6 +146,7 @@ class TankRoom extends Room {
     this.activeBotLetter = null;  // letter whose Bot.startTurn() has already run this turn; reset whenever
                                    // currentPlayer changes (fire, disconnect-elimination, restart) so the
                                    // next bot turn (if any) gets a fresh startTurn() call
+    this.nextBotSeq = 1;          // room-scoped counter for botSeatId() — see "addBot" below
     const validDifficulties = ["easy", "medium", "hard", "expert"];
     this.botDifficulty = validDifficulties.includes(options.botDifficulty) ? options.botDifficulty : "medium";
 
@@ -200,6 +234,42 @@ class TankRoom extends Room {
       targetClient.leave();
     });
 
+    // Bots are opt-in: the host adds each one explicitly (e.g. a "+ BOT"
+    // button in the lobby), rather than every unfilled seat auto-becoming
+    // a bot at start. A bot occupies a real seat in this.state.players —
+    // same map humans join into — so it counts against the same capacity
+    // check onJoin already enforces, shows up in the same unified lobby
+    // list, and "start" (below) treats it identically to a human seat when
+    // assigning board letters.
+    this.onMessage("addBot", (client) => {
+      const requester = this.state.players.get(client.sessionId);
+      if (!requester || !requester.isOwner) return;
+      if (this.state.started) return;
+      if (this.state.players.size >= LETTERS.length) return; // lobby full — same cap onJoin enforces
+
+      const bot = new Player();
+      bot.nickname = `Bot (${this.botDifficulty})`;
+      bot.isBot = true;
+      bot.ready = true;      // bots never block the "allReady" check in "start"
+      bot.connected = true;
+
+      this.state.players.set(botSeatId(this.nextBotSeq++), bot);
+      this.setMetadata({ ...this.metadata, playerCount: this.state.players.size });
+    });
+
+    this.onMessage("removeBot", (client, payload) => {
+      const requester = this.state.players.get(client.sessionId);
+      if (!requester || !requester.isOwner) return;
+      if (this.state.started) return;
+
+      const targetId = payload?.botId;
+      const target = targetId && this.state.players.get(targetId);
+      if (!target || !target.isBot) return;
+
+      this.state.players.delete(targetId);
+      this.setMetadata({ ...this.metadata, playerCount: this.state.players.size });
+    });
+
     // --- start ------------------------------------------------------------
 
     this.onMessage("start", (client) => {
@@ -210,10 +280,15 @@ class TankRoom extends Room {
       const allReady = [...this.state.players.values()].every((p) => p.ready);
       if (!allReady || this.state.players.size < 2) return;
 
-      const sessionIds = [...this.state.players.keys()]; // owner first, forever
+      // Every occupied seat — human or bot, whichever order they joined/were
+      // added in — gets a letter. Unlike before, there's no padding out to
+      // MAX_PLAYERS: a lobby of 2 humans and 0 bots starts a 2-tank game.
+      const seatIds = [...this.state.players.keys()]; // owner first, forever
+      if (seatIds.length > LETTERS.length) return; // shouldn't happen — onJoin/addBot both cap below this
+
       const seed = Math.floor(Math.random() * 2 ** 31);
 
-      // Letters are assigned here, fresh, from current join order — not
+      // Letters are assigned here, fresh, from current join/add order — not
       // maintained incrementally through the lobby (see onJoin's comment).
       // Rebuilding both maps from scratch each time this handler runs is
       // deliberate: it's idempotent, so a failed start attempt below
@@ -225,28 +300,22 @@ class TankRoom extends Room {
       this.bots.clear();
       this.activeBotLetter = null;
 
-      sessionIds.forEach((sessionId, i) => {
+      seatIds.forEach((id, i) => {
         const letter = LETTERS[i];
-        this.sessionToLetter.set(sessionId, letter);
-        this.letterToSession.set(letter, sessionId);
+        const seat = this.state.players.get(id);
 
-        const seatedPlayer = this.state.players.get(sessionId);
-        seatedPlayer.letter = letter;
-        seatedPlayer.color = resolvePlayerColour(this.config, letter).join(",");
+        this.letterToSession.set(letter, id);
+        seat.letter = letter;
+        seat.color = resolvePlayerColour(this.config, letter).join(",");
+
+        if (seat.isBot) {
+          this.bots.set(letter, new Bot(letter, this.botDifficulty));
+        } else {
+          this.sessionToLetter.set(id, letter);
+        }
       });
 
-      // Whatever letters real players didn't claim get filled with Bots —
-      // a started game always fields all four tanks. With a full human
-      // lobby this is just an empty slice and behaves exactly as before.
-      const botLetters = LETTERS.slice(sessionIds.length);
-      for (const letter of botLetters) {
-        const seatId = botSeatId(letter);
-        this.sessionToLetter.set(seatId, letter);
-        this.letterToSession.set(letter, seatId);
-        this.bots.set(letter, new Bot(letter, this.botDifficulty));
-      }
-
-      const activeLetters = LETTERS.slice(0, sessionIds.length + botLetters.length);
+      const activeLetters = LETTERS.slice(0, seatIds.length);
 
       this.game = new GameLogic(this.config, this.levelLayouts, seed, activeLetters);
 
@@ -266,18 +335,13 @@ class TankRoom extends Room {
       this.lock(); // remove from public listing — onJoin already rejects late joiners,
                     // but without this a started game still shows up in "Join Others"
 
-      for (const sessionId of sessionIds) {
+      for (const id of seatIds) {
+        const seat = this.state.players.get(id);
         const tankState = new TankState();
-        tankState.letter = this.sessionToLetter.get(sessionId);
-        tankState.nickname = this.state.players.get(sessionId)?.nickname || `Player ${tankState.letter}`;
-        this.state.tanks.set(sessionId, tankState);
-      }
-      for (const letter of botLetters) {
-        const tankState = new TankState();
-        tankState.letter = letter;
-        tankState.nickname = `Bot (${this.botDifficulty})`;
-        tankState.isBot = true;
-        this.state.tanks.set(botSeatId(letter), tankState);
+        tankState.letter = seat.letter;
+        tankState.nickname = seat.isBot ? seat.nickname : (seat.nickname || `Player ${seat.letter}`);
+        tankState.isBot = seat.isBot;
+        this.state.tanks.set(id, tankState);
       }
 
       this.syncFullState();
@@ -325,17 +389,28 @@ class TankRoom extends Room {
     });
   }
 
-  // Fires whichever tank holds `letter`'s turn right now and passes the
-  // turn. Shared by the human "action"/"fire" handler and updateBots() —
-  // originally this logic only lived inline in the "action" handler, but
-  // a Bot deciding to fire needs to trigger the exact same sequence with
-  // no human client or "action" message involved.
+  // --- Turn-resolution + state-sync helpers (used by both human "action"
+  // handling above and updateBots() below) ------------------------------
+
+  /**
+   * Fires whichever tank holds `letter`'s turn right now and passes the
+   * turn. Shared by the human "action"/"fire" handler and updateBots() —
+   * originally this logic only lived inline in the "action" handler, but
+   * a Bot deciding to fire needs to trigger the exact same sequence with
+   * no human client or "action" message involved.
+   *
+   * @param {string} letter - Board letter of the tank firing.
+   * @returns {void}
+   */
   fireTank(letter) {
     const tank = this.game.players.get(letter);
     if (!tank) return;
 
     tank.stopAdjustment();
-    const doubleBlastRadius = !tank.projectile.normal_size;
+    // Read *before* setFire() below, so this reflects whichever state was
+    // active at the moment of firing regardless of anything setFire()/
+    // tick() does to the flag afterward (see Projectile.js's own reset points).
+    const doubleBlastRadius = tank.projectile.doubleBlastRadius;
     tank.projectile.setFire(this.game, tank);
 
     // Cosmetic-only: lets clients replay the same simple trajectory
@@ -372,13 +447,18 @@ class TankRoom extends Room {
     this.activeBotLetter = null;
   }
 
-  // Drives whichever Bot currently holds the turn, if any. Bots "play" by
-  // holding the same rotate/power flags a real client's "action" messages
-  // would set on their Tank (see Bot.js's own header) — Tank.tick(), called
-  // right after this in update()'s per-tank loop, is what actually turns
-  // those flags into turretAngle/power changes, exactly as it does for a
-  // human's queued input. Call this before that per-tank loop each tick so
-  // a flag a bot sets this frame gets applied within the same frame.
+  /**
+   * Drives whichever Bot currently holds the turn, if any. Bots "play" by
+   * holding the same rotate/power flags a real client's "action" messages
+   * would set on their Tank (see Bot.js's own header) — Tank.tick(), called
+   * right after this in update()'s per-tank loop, is what actually turns
+   * those flags into turretAngle/power changes, exactly as it does for a
+   * human's queued input. Call this before that per-tank loop each tick so
+   * a flag a bot sets this frame gets applied within the same frame.
+   *
+   * @param {number} dt - Seconds elapsed since the last simulation tick.
+   * @returns {void}
+   */
   updateBots(dt) {
     const game = this.game;
     const letter = game.currentPlayer;
@@ -402,9 +482,13 @@ class TankRoom extends Room {
     }
   }
 
-  // Copies everything from the plain-JS GameLogic/Tank simulation onto the
-  // synced schema. Called at game start, on restart, and whenever a level
-  // switch happens (board/tanks are rebuilt fresh by generateLevel()).
+  /**
+   * Copies everything from the plain-JS GameLogic/Tank simulation onto the
+   * synced schema. Called at game start, on restart, and whenever a level
+   * switch happens (board/tanks are rebuilt fresh by generateLevel()).
+   *
+   * @returns {void}
+   */
   syncFullState() {
     const game = this.game;
 
@@ -431,6 +515,16 @@ class TankRoom extends Room {
     }
   }
 
+  /**
+   * Copies one Tank's simulation state onto its synced TankState. Called
+   * both by syncFullState() (every field, once, at start/restart/level
+   * switch) and directly from update()'s own per-tank loop every tick.
+   *
+   * @param {Tank} tank - Source of truth: the plain-JS simulation object.
+   * @param {TankState} tankState - Synced schema instance to write onto.
+   * @param {GameLogic} game - The active game, for `alive` (needs remainingTanks).
+   * @returns {void}
+   */
   syncTankState(tank, tankState, game) {
     tankState.x = tank.x;
     tankState.y = tank.y;
@@ -446,6 +540,17 @@ class TankRoom extends Room {
     tankState.colourName = this.colourNames[tank.colour.join(",")] || "Player";
   }
 
+  /**
+   * Fixed-rate simulation tick, running at GameLogic.FPS once the game has
+   * started (see the "start" handler's setSimulationInterval call). Drives
+   * bots, ticks every living tank + its projectile, broadcasts death
+   * events, and syncs the result onto the schema — unless a level
+   * transition is being deliberately held back (see the currentLevel
+   * check below).
+   *
+   * @param {number} dt - Seconds elapsed since the last tick.
+   * @returns {void}
+   */
   update(dt) {
     if (!this.game || this.levelTransitionPending) return;
     const game = this.game;
@@ -524,6 +629,18 @@ class TankRoom extends Room {
     this.state.terrainPosition = new ArraySchema(...game.terrainPosition);
   }
 
+  // --- Colyseus lifecycle: join / leave / reconnect ---------------------
+
+  /**
+   * Colyseus lifecycle hook: a client is joining this room (lobby only —
+   * see the `started` guard below).
+   *
+   * @param {Client} client - The joining Colyseus client.
+   * @param {object} options - { nickname, code } from the client's join request.
+   * @returns {void}
+   * @throws {Error} If the game already started, the lobby is private and
+   *   the code doesn't match, or the lobby is already full.
+   */
   onJoin(client, options) {
     if (this.state.started) {
       throw new Error("This game has already started.");
@@ -557,6 +674,19 @@ class TankRoom extends Room {
     this.setMetadata({ ...this.metadata, playerCount: this.state.players.size });
   }
 
+  /**
+   * Colyseus lifecycle hook: a client's connection dropped, intentionally
+   * or not. Distinguishes an explicit leave/kick (skip reconnection grace,
+   * remove immediately) from everything else (grant a short reconnection
+   * grace before actually removing the player) — see the extensive inline
+   * comments below for why `consented` alone can't be trusted for that
+   * distinction.
+   *
+   * @param {Client} client - The disconnecting Colyseus client.
+   * @param {boolean} consented - Colyseus's own guess at whether this was
+   *   an intentional disconnect; not fully trusted here (see body).
+   * @returns {Promise<void>}
+   */
   async onLeave(client, consented) {
     const player = this.state.players.get(client.sessionId);
     if (!player) return;
@@ -611,6 +741,15 @@ class TankRoom extends Room {
     }
   }
 
+  /**
+   * Fully removes a player from this room: eliminates their tank in-game
+   * (if any, exactly like a combat death), clears their lobby/game state,
+   * and reassigns ownership if they were the owner. Called both for a
+   * confirmed-gone reconnection timeout and for an explicit kick/leave.
+   *
+   * @param {Client} client - The Colyseus client to remove.
+   * @returns {void}
+   */
   removePlayer(client) {
     const player = this.state.players.get(client.sessionId);
     if (!player) return;

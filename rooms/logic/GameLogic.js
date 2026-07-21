@@ -1,25 +1,37 @@
 // rooms/logic/GameLogic.js
-// Port of client GameLogic.js. This is now the single authority for turn
-// order, elimination, level progression, and scoring — TurnManager.js
-// has been removed since it duplicated this same bookkeeping in a
-// parallel, session-keyed structure. TankRoom.js is responsible for
-// translating game.currentPlayer (a board letter) into the session id
-// that actually holds the turn, since Colyseus/clients key off sessions.
 //
-// Removed vs. the client version: `sprites` (a p5/browser asset cache —
-// meaningless on the server, and only ever used by Tank.deployParachute(),
-// which was rendering-only and has been dropped from server Tank.js).
+// Single source of truth for one match's server-side simulation state.
+// Depends on shared/constants, utils, Rng, Board, and Tank — everything
+// else in rooms/logic/.
 
-const { Board } = require('./Board');
-const { Tank } = require('./Tank');
-const { createRng } = require('./Rng');
 const { FPS, INITIAL_PARACHUTES } = require('../../shared/constants');
 const { resolvePlayerColour } = require('./utils');
+const { createRng } = require('./Rng');
+const { Board } = require('./Board');
+const { Tank } = require('./Tank');
 
+/**
+ * GameLogic is the single source of truth for one match's server-side
+ * simulation state: the current level's board, every Tank, turn order,
+ * wind, scores/parachutes, and win/loss. TankRoom drives it by calling
+ * into Tank/Bot per tick and reading its public fields to broadcast state;
+ * GameLogic itself never touches networking or Colyseus session ids.
+ */
 class GameLogic {
   static FPS = FPS;
   static INITIAL_PARACHUTES = INITIAL_PARACHUTES;
 
+  /**
+   * @param {object} config - Parsed levels/config.json (levels array + player_colours).
+   * @param {Object.<string, string[]>} levelLayouts - Map of layout filename
+   *   (e.g. 'level1.txt') to its raw ASCII lines, as consumed by Board.loadLayout().
+   * @param {number} [seed] - Seed for the deterministic RNG driving wind
+   *   (and bot decisions, via game.rng). Falls back to Date.now() for local/offline
+   *   testing — TankRoom always supplies a real seed for parity/replay.
+   * @param {string[]|null} [activeLetters] - Board letters that actually have a
+   *   joined session behind them; only these get a Tank in generateLevel().
+   *   null disables filtering (every spawn in the layout gets a Tank).
+   */
   constructor(config, levelLayouts, seed, activeLetters) {
     this.config = config;
     this.levelLayouts = levelLayouts; // { 'level1.txt': [lines], ... }
@@ -64,9 +76,27 @@ class GameLogic {
     this.generateLevel();
   }
 
+  // --- Derived read-only board accessors ------------------------------
+  // Thin passthroughs so callers (Tank, Bot, TankRoom) can read
+  // game.terrainPosition / game.trees without reaching into game.board
+  // directly — keeps Board an implementation detail of GameLogic.
+
+  /** @returns {number[]} Pixel-indexed terrain heightmap for the current level (see Board.js). */
   get terrainPosition() { return this.board.terrainPosition; }
+
+  /** @returns {number[]} X pixel-columns of tree cells for the current level (see Board.js). */
   get trees() { return this.board.trees; }
 
+  // --- Level generation --------------------------------------------------
+
+  /**
+   * (Re)build the current level from scratch: loads the level's board
+   * layout, creates one Tank per active player spawn (carrying forward
+   * score/parachutes from the previous level where applicable), rolls a
+   * fresh wind, and sets up turn order. Called from the constructor for
+   * level 1, and again by levelSwitch()/restartGame() for subsequent
+   * levels or a fresh game.
+   */
   generateLevel() {
     this.players.clear();
     this.damagedTanks.clear();
@@ -90,7 +120,7 @@ class GameLogic {
     // are reassigned, so Tank's constructor still sees last level's
     // arrays and can carry scores/parachutes forward - mirrors the same
     // (load-bearing) ordering quirk in App.generateLevel().
-    for (const start of this.board.playerStarts) {
+    for (const start of this.board.playerSpawns) {
       if (this.activeLetters && !this.activeLetters.includes(start.id)) continue;
 
       const tank = new Tank(start.id, start.x, start.y, this);
@@ -124,6 +154,15 @@ class GameLogic {
     this.playerOrder();
   }
 
+  // --- Turn order ----------------------------------------------------------
+
+  /**
+   * Advance whose turn it is: finds the next living player at/after
+   * playerIndex (wrapping around playerIDs), sets currentPlayer/nextPlayer
+   * accordingly, and applies a small random drift to wind. Called after
+   * generateLevel() sets up a fresh round, and again whenever the current
+   * player's tank is destroyed (see Tank.selfDestruct()).
+   */
   playerOrder() {
     const { id, index } = findNextAlive(this.playerIDs, this.remainingTanks, this.playerIndex);
     this.currentPlayer = id;
@@ -134,14 +173,27 @@ class GameLogic {
     this.playerIndex++;
   }
 
+  /**
+   * Advance to the next level: increments currentLevel, resets turn order
+   * to the start of playerIDs, and regenerates the board/tanks via
+   * generateLevel(). Called by Tank.selfDestruct() once only one tank
+   * remains and the match isn't on its last level yet.
+   */
   levelSwitch() {
     this.currentLevel++;
     this.playerIndex = 0;
     this.generateLevel();
   }
 
-  // descending bubble sort of playerIDs/playerScores by score, matching
-  // App.getWinner()'s exact algorithm
+  // --- Win / loss / restart -------------------------------------------
+
+  /**
+   * Sort playerIDs and playerScores together, descending by score, so
+   * playerIDs[0] is the match winner. Mutates both arrays in place —
+   * descending bubble sort, matching App.getWinner()'s exact algorithm
+   * (kept identical rather than swapped for a stdlib sort, so tie-breaking
+   * order stays byte-for-byte consistent with the client's original logic).
+   */
   getWinner() {
     for (let i = 0; i < this.playerScores.length - 1; i++) {
       for (let j = 0; j < this.playerScores.length - i - 1; j++) {
@@ -153,22 +205,42 @@ class GameLogic {
     }
   }
 
+  /**
+   * Reset the match back to level 1 with a clean gameEnded flag. Scores
+   * and parachutes aren't reset explicitly — generateLevel() rebuilds
+   * playerScores/playerParachutes from scratch, and new Tanks are created
+   * with no prior-level entry to carry forward, so they naturally start fresh.
+   */
   restartGame() {
     this.currentLevel = 1;
     this.gameEnded = false;
     this.generateLevel(); // fresh scores/parachutes fall out of this naturally
   }
 
+  /** @returns {boolean} Whether the current level has one or zero tanks left standing. */
   isLevelOver() {
     return this.remainingTanks.length <= 1;
   }
 
+  /** @returns {boolean} Whether the level that just ended was also the match's last configured level. */
   isGameOver() {
     return this.isLevelOver() && this.currentLevel === this.config.levels.length;
   }
 }
 
-// Finds the next alive player starting from fromIndex, wrapping around playerIDs.
+/**
+ * Find the next living player at or after fromIndex, wrapping around
+ * playerIDs as many times as needed (bounded by a safety guard).
+ *
+ * @param {string[]} playerIDs - All player ids for the current level, in turn order.
+ * @param {string[]} remainingTanks - Ids still alive this level.
+ * @param {number} fromIndex - Index into playerIDs to start searching from
+ *   (not pre-wrapped — may already exceed playerIDs.length, see playerOrder()).
+ * @returns {{id: string, index: number}} The next living player's id, and
+ *   the (possibly un-wrapped) index it was found at. Falls back to
+ *   `playerIDs[fromIndex % playerIDs.length]` if no living player is found
+ *   within the guard limit (e.g. every remaining tank died the same tick).
+ */
 function findNextAlive(playerIDs, remainingTanks, fromIndex) {
   let idx = fromIndex;
   let guard = 0; // safety net against an all-dead edge case looping forever
