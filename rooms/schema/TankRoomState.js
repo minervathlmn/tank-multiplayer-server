@@ -23,7 +23,10 @@ const { TankState } = require("./TankState");
  * real Colyseus sessionId; see botSeatId() in TankRoom.js.
  *
  * @property {string} nickname - Display name chosen at join time (humans)
- *   or "Bot (difficulty)" (bots, set by "addBot").
+ *   or "Bot" (bots, set by "addBot" — difficulty is tracked separately, see `difficulty` below).
+ * @property {string} difficulty - Bot-only: 'easy'|'medium'|'hard'|'expert', set from the
+ *   room's default at "addBot" time and host-adjustable per-bot afterward via
+ *   "setBotDifficulty". Empty string for human seats.
  * @property {string} color - "r,g,b" string, resolved from config.player_colours
  *   once the game starts. NOTE: spelled "color" (American) here, unlike
  *   TankState's "colour" fields (colourR/G/B/colourName) and everything else
@@ -49,6 +52,7 @@ class Player extends Schema {
     this.ready = false;
     this.connected = true;
     this.isBot = false;    // true for seats added via "addBot" — see class doc above
+    this.difficulty = "";  // bot-only: 'easy'|'medium'|'hard'|'expert' — see class doc above
   }
 }
 // Colyseus schema types, registered via the functional type() API rather
@@ -62,6 +66,7 @@ type("boolean")(Player.prototype, "isOwner");
 type("boolean")(Player.prototype, "ready");
 type("boolean")(Player.prototype, "connected");
 type("boolean")(Player.prototype, "isBot");
+type("string")(Player.prototype, "difficulty");
 
 /**
  * Root synced state for one TankRoom — everything Colyseus pushes to every
@@ -76,6 +81,7 @@ type("boolean")(Player.prototype, "isBot");
  * @property {string} currentTurnSessionId - sessionId of whichever client currently
  *   holds the turn — TankRoom's translation of GameLogic.currentPlayer (a board
  *   letter) into the session id clients actually key off.
+ * @property {string} this.turnEndsAt - 
  * @property {string} ownerNickname - Nickname of the lobby owner, denormalized here
  *   so lobby UI doesn't need to cross-reference players by isOwner.
  * @property {boolean} isPrivate - Whether joining requires the matching `code`.
@@ -101,6 +107,8 @@ class TankRoomState extends Schema {
     this.players = new MapSchema();
     this.started = false;
     this.currentTurnSessionId = "";
+    this.turnEndsAt = 0; // ms epoch (Date.now()-based); client computes remaining
+                          // time locally as turnEndsAt - Date.now() each frame
     this.ownerNickname = "";
     this.isPrivate = false;
     this.code = "";        // 4-digit join code, only meaningful when isPrivate is true
@@ -125,6 +133,7 @@ class TankRoomState extends Schema {
 type({ map: Player })(TankRoomState.prototype, "players");
 type("boolean")(TankRoomState.prototype, "started");
 type("string")(TankRoomState.prototype, "currentTurnSessionId");
+type("number")(TankRoomState.prototype, "turnEndsAt");
 type("string")(TankRoomState.prototype, "ownerNickname");
 type("boolean")(TankRoomState.prototype, "isPrivate");
 type("string")(TankRoomState.prototype, "code");

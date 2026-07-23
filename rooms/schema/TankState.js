@@ -78,14 +78,14 @@ class TankState extends Schema {
 // if fields are added/reordered, so the two lists stay easy to diff by eye.
 type("string")(TankState.prototype, "letter");
 type("string")(TankState.prototype, "nickname");
-type("number")(TankState.prototype, "x");
-type("number")(TankState.prototype, "y");
-type("number")(TankState.prototype, "health");
-type("number")(TankState.prototype, "fuel");
-type("number")(TankState.prototype, "power");
-type("number")(TankState.prototype, "score");
-type("number")(TankState.prototype, "parachute");
-type("number")(TankState.prototype, "turretAngle");
+type("int16")(TankState.prototype, "x");
+type("int16")(TankState.prototype, "y");
+type("uint8")(TankState.prototype, "health");
+type("uint16")(TankState.prototype, "fuel");
+type("uint8")(TankState.prototype, "power");
+type("uint32")(TankState.prototype, "score");
+type("uint8")(TankState.prototype, "parachute");
+type("int8")(TankState.prototype, "turretAngle");
 type("boolean")(TankState.prototype, "falling");
 type("boolean")(TankState.prototype, "alive");
 type("boolean")(TankState.prototype, "isBot");

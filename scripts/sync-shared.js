@@ -6,6 +6,8 @@
 // merge, an npm/yarn workspace with a real tank-shared package is the
 // "grown-up" version of this same idea — but for two files, the copy
 // script is proportionate.)
+//
+// command: `npm run sync-client`
 
 const fs = require('fs');
 const path = require('path');

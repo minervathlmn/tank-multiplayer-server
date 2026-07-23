@@ -10,7 +10,7 @@ const fs = require('fs');
 const path = require('path');
 const { Room } = require('colyseus');
 const { ArraySchema } = require('@colyseus/schema');
-const { MAX_PLAYERS } = require('../shared/constants');
+const { MAX_PLAYERS, BOT_DIFFICULTIES, TURN_TIME_LIMIT_MS } = require('../shared/constants');
 const { radians, sin, cos, resolvePlayerColour, buildColourNameLookup } = require('./logic/utils');
 const { Board } = require('./logic/Board');
 const { Explosion } = require('./logic/Explosion');
@@ -18,14 +18,6 @@ const { GameLogic } = require('./logic/GameLogic');
 const { Bot } = require('./logic/Bot');
 const { TankState } = require('./schema/TankState');
 const { TankRoomState, Player } = require('./schema/TankRoomState');
-
-// Single source of truth for room capacity. Bump this to raise or lower
-// the player cap — LETTERS below and Room.maxClients (see onCreate) both
-// derive from it, so nothing else needs to change to add/remove seats.
-// Caps out at 26 (Z) since letters are generated via charCode arithmetic;
-// a design wanting more than 26 seats would need a different labeling
-// scheme entirely, not just a bigger number here.
-// const MAX_PLAYERS = 4;
 
 // Board letters assigned by join/add order, locked in once at "start" —
 // room creator is always 'A', next seat 'B', etc., based on this.state.players'
@@ -88,6 +80,24 @@ const LOBBY_RECONNECT_GRACE_SECONDS = 4;
 // rather than guessing a number of ms.
 const EXPLOSION_ANIMATION_MS = Math.ceil((Explosion.ANIMATION_TICKS / GameLogic.FPS) * 1000);
 
+// Bots don't check for a client-visible "shot still animating" state — the
+// server just knows whether a projectile is still flying (see
+// updateBots()). This buffer is added *after* every remainingTank's
+// projectile has stopped flying, mirroring LEVEL_TRANSITION_SAFETY_MS's
+// purpose but for every ordinary turn, not just a level switch: it lets
+// the explosion animation (client-only, no server field to check) finish
+// before the next bot starts visibly moving its turret.
+const BOT_TURN_DELAY_MS = EXPLOSION_ANIMATION_MS + 300;
+
+// Floor on time between a bot starting to aim and actually firing. Bot.tick()
+// can converge to its target angle/power in as little as one tick if it
+// happened to already be close (e.g. same angle as its last shot) — firing
+// that instantly reads as robotic even though BOT_TURN_DELAY_MS already
+// paced the *start* of the turn. This only holds back an already-ready
+// shot; a naturally slow convergence (big angle/power swing) still fires
+// the instant it's ready, no extra wait added on top.
+const MIN_BOT_TURN_MS = 2000;
+
 // Small, explicitly-separate safety margin — NOT part of the "real"
 // duration above — to absorb the shotFired/tankExploded network hop and
 // the odd dropped client frame. Safe to shrink/remove if it ever proves
@@ -146,9 +156,19 @@ class TankRoom extends Room {
     this.activeBotLetter = null;  // letter whose Bot.startTurn() has already run this turn; reset whenever
                                    // currentPlayer changes (fire, disconnect-elimination, restart) so the
                                    // next bot turn (if any) gets a fresh startTurn() call
+    this.botWaitUntil = null;     // Date.now()-based deadline; bot may not startTurn()
+                                   // until this passes — see updateBots()
+    this.botTurnStartAt = null;      // Date.now() when this bot's aiming actually began
+    this.pendingBotFireLetter = null; // set when Bot.tick() says "ready" but MIN_BOT_TURN_MS hasn't elapsed yet
     this.nextBotSeq = 1;          // room-scoped counter for botSeatId() — see "addBot" below
-    const validDifficulties = ["easy", "medium", "hard", "expert"];
-    this.botDifficulty = validDifficulties.includes(options.botDifficulty) ? options.botDifficulty : "medium";
+    // Room-level default only — the difficulty each individual bot actually
+    // plays at lives on that bot's own Player.difficulty (set from this
+    // default at "addBot" time, then host-adjustable per-bot afterward via
+    // "setBotDifficulty"). See that handler and "start" below.
+    this.botDifficulty = BOT_DIFFICULTIES.includes(options.botDifficulty) ? options.botDifficulty : "medium";
+
+    this.turnStartedAt = null;
+    this.turnTrackedFor = null;
 
     // Set while we're deliberately holding back a level-switch sync so the
     // last shot's flight + explosion can finish animating on clients before
@@ -248,13 +268,31 @@ class TankRoom extends Room {
       if (this.state.players.size >= LETTERS.length) return; // lobby full — same cap onJoin enforces
 
       const bot = new Player();
-      bot.nickname = `Bot (${this.botDifficulty})`;
+      bot.nickname = "Bot";
       bot.isBot = true;
+      bot.difficulty = this.botDifficulty; // room default; host can adjust per-bot below
       bot.ready = true;      // bots never block the "allReady" check in "start"
       bot.connected = true;
 
       this.state.players.set(botSeatId(this.nextBotSeq++), bot);
       this.setMetadata({ ...this.metadata, playerCount: this.state.players.size });
+    });
+
+    // Host-only, lobby-only: adjusts one already-added bot's difficulty in
+    // place (the dropdown next to "Bot" in the room screen). Deliberately
+    // separate from "addBot" — the host may want to tweak a bot's
+    // difficulty after adding it, without removing/re-adding the seat
+    // (which would also lose its board-order position).
+    this.onMessage("setBotDifficulty", (client, payload) => {
+      const requester = this.state.players.get(client.sessionId);
+      if (!requester || !requester.isOwner) return;
+      if (this.state.started) return;
+
+      const target = payload?.botId && this.state.players.get(payload.botId);
+      if (!target || !target.isBot) return;
+
+      if (!BOT_DIFFICULTIES.includes(payload?.difficulty)) return;
+      target.difficulty = payload.difficulty;
     });
 
     this.onMessage("removeBot", (client, payload) => {
@@ -309,7 +347,7 @@ class TankRoom extends Room {
         seat.color = resolvePlayerColour(this.config, letter).join(",");
 
         if (seat.isBot) {
-          this.bots.set(letter, new Bot(letter, this.botDifficulty));
+          this.bots.set(letter, new Bot(letter, seat.difficulty));
         } else {
           this.sessionToLetter.set(id, letter);
         }
@@ -382,6 +420,9 @@ class TankRoom extends Room {
       }
       this.levelTransitionPending = false;
       this.activeBotLetter = null;
+      this.botWaitUntil = null;
+      this.botTurnStartAt = null;
+      this.pendingBotFireLetter = null;
 
       this.game.restartGame();
       this.syncFullState();
@@ -445,6 +486,9 @@ class TankRoom extends Room {
     // Whoever's turn it is now (human or bot) starts fresh — see
     // updateBots() for why this matters even when the new turn is human.
     this.activeBotLetter = null;
+    this.botWaitUntil = null;
+    this.botTurnStartAt = null;
+    this.pendingBotFireLetter = null;
   }
 
   /**
@@ -468,17 +512,55 @@ class TankRoom extends Room {
       // Current turn isn't a bot's — clear any stale tracking so that if
       // play comes back around to a bot later, it gets a fresh startTurn().
       this.activeBotLetter = null;
+      this.botWaitUntil = null;
+      this.botTurnStartAt = null;
+      this.pendingBotFireLetter = null;
       return;
     }
 
     if (this.activeBotLetter !== letter) {
+      const anyFlying = [...game.remainingTanks].some((l) => {
+        const t = game.players.get(l);
+        return t && t.projectile.flying;
+      });
+
+      if (anyFlying) {
+        this.botWaitUntil = null; // stay disarmed while a shot's still in the air
+        return;
+      }
+
+      if (this.botWaitUntil === null) {
+        this.botWaitUntil = Date.now() + BOT_TURN_DELAY_MS;
+        return;
+      }
+
+      if (Date.now() < this.botWaitUntil) return;
+
       bot.startTurn(game);
       this.activeBotLetter = letter;
+      this.botWaitUntil = null;
+      this.botTurnStartAt = Date.now(); // aiming starts now — MIN_BOT_TURN_MS counts from here
+    }
+
+    // A previous tick's bot.tick() already said "ready" but we're still
+    // waiting out MIN_BOT_TURN_MS — bot.tick() would just return false now
+    // (its state already flipped to 'idle'), so don't call it again; only
+    // check whether the floor has passed yet.
+    if (this.pendingBotFireLetter) {
+      if (Date.now() - this.botTurnStartAt >= MIN_BOT_TURN_MS) {
+        this.fireTank(this.pendingBotFireLetter);
+        this.pendingBotFireLetter = null;
+      }
+      return;
     }
 
     const shouldFire = bot.tick(game, dt);
     if (shouldFire) {
-      this.fireTank(letter); // also clears activeBotLetter, for whoever's up next
+      if (Date.now() - this.botTurnStartAt >= MIN_BOT_TURN_MS) {
+        this.fireTank(letter);
+      } else {
+        this.pendingBotFireLetter = letter; // hold — released above once the floor passes
+      }
     }
   }
 
@@ -504,13 +586,13 @@ class TankRoom extends Room {
 
     this.state.currentTurnSessionId = this.letterToSession.get(game.currentPlayer) ?? "";
 
-    for (const [sessionId, letter] of this.sessionToLetter) {
+    for (const [letter, id] of this.letterToSession) {
       const tank = game.players.get(letter);
-      const tankState = this.state.tanks.get(sessionId);
+      const tankState = this.state.tanks.get(id);
       if (!tank || !tankState) continue;
       this.syncTankState(tank, tankState, game);
 
-      const player = this.state.players.get(sessionId);
+      const player = this.state.players.get(id);
       if (player) player.color = tank.colour.join(",");
     }
   }
@@ -556,6 +638,19 @@ class TankRoom extends Room {
     const game = this.game;
     const levelBefore = game.currentLevel;
 
+    if (this.turnTrackedFor !== game.currentPlayer) {
+      this.turnTrackedFor = game.currentPlayer;
+      this.turnStartedAt = Date.now();
+      this.state.turnEndsAt = this.turnStartedAt + TURN_TIME_LIMIT_MS;
+    }
+
+    if (this.turnStartedAt && Date.now() - this.turnStartedAt >= TURN_TIME_LIMIT_MS) {
+      // Force-fire whoever's turn it is (bot or human) with their tank's
+      // current aim/power. For bots this is a safety net for a stuck
+      // convergence (shouldn't normally trigger); for humans it's AFK
+      // protection — same call either way.
+      this.fireTank(game.currentPlayer);
+    }
     this.updateBots(dt);
 
     // Only alive tanks tick — matches original drawTanks()'s iteration
@@ -564,13 +659,6 @@ class TankRoom extends Room {
       const tank = game.players.get(letter);
       if (!tank) continue;
 
-      // Confirmed from sketch.js's drawTanks(): a tank whose terrain was
-      // just carved out from under it (added to damagedTanks by
-      // Explosion.updateTerrain()) starts falling; otherwise it stays
-      // glued to the terrain height at its x position. This was never in
-      // GameLogic/Tank/Explosion — it only lived in the client's render
-      // loop, but it's real game logic (falling affects health), so it
-      // moves server-side now.
       if (game.damagedTanks.has(tank)) {
         tank.fall();
       } else {
@@ -588,7 +676,19 @@ class TankRoom extends Room {
       if (tank.health <= 0 || !game.remainingTanks.includes(letter)) {
         const exp = tank.projectile.explosion;
         this.broadcast("tankExploded", { x: exp.x, y: exp.y, radius: exp.radius });
+
+        const sessionId = this.letterToSession.get(letter);
+        const tankState = sessionId && this.state.tanks.get(sessionId);
+        if (tankState) tankState.alive = false;
       }
+
+      // If that tick just triggered levelSwitch() (via selfDestruct()),
+      // game.players/game.remainingTanks now belong to the NEXT level —
+      // [...game.remainingTanks] above was snapshotted from the OLD
+      // level, so any letters after this one in that snapshot must not
+      // be looked up against the new map. Bail immediately; the
+      // currentLevel check right after this loop picks up from here.
+      if (game.currentLevel !== levelBefore) break;
     }
 
     // A level switch rebuilds board + all Tank instances inside GameLogic,
@@ -612,9 +712,9 @@ class TankRoom extends Room {
       return;
     }
 
-    for (const [sessionId, letter] of this.sessionToLetter) {
+    for (const [letter, id] of this.letterToSession) {
       const tank = game.players.get(letter);
-      const tankState = this.state.tanks.get(sessionId);
+      const tankState = this.state.tanks.get(id);
       if (!tank || !tankState) continue;
       this.syncTankState(tank, tankState, game);
     }
@@ -764,6 +864,9 @@ class TankRoom extends Room {
       if (tank && this.game.remainingTanks.includes(letter)) {
         tank.selfDestruct(this.game, 0); // may itself advance the turn via playerOrder()
         this.activeBotLetter = null; // whoever holds the turn now (possibly a bot) starts fresh
+        this.botWaitUntil = null;
+        this.botTurnStartAt = null;
+        this.pendingBotFireLetter = null;
         const exp = tank.projectile.explosion;
         this.broadcast("tankExploded", { x: exp.x, y: exp.y, radius: exp.radius });
         this.syncFullState();

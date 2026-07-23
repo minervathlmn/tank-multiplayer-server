@@ -4,7 +4,7 @@
 // Tank through the same input-intent flags a human client's actions would
 // set. Depends on shared/constants, utils, and Board.
 
-const { FPS, GRAVITY, WIND_SCALE, DRAG_COEFF, TURRET_LENGTH, TURRET_DEG_PER_SEC, POWER_PER_SEC, TANK_PS, CELLSIZE } = require('../../shared/constants');
+const { FPS, GRAVITY, WIND_SCALE, DRAG_COEFF, TURRET_LENGTH } = require('../../shared/constants');
 const { clamp, radians, sin, cos } = require('./utils');
 const { Board } = require('./Board');
 
@@ -125,23 +125,16 @@ class Bot {
     this.letter = letter;
     this.preset = DIFFICULTY_PRESETS[difficulty] ?? DIFFICULTY_PRESETS.medium;
 
-    // State machine: idle -> [moving ->] aiming -> powering -> (fire, back
-    // to idle), with a brief 'settle' pause inserted between each step.
-    // 'moving' is skipped entirely when the plan doesn't call for
-    // repositioning (the common case). There's no persisted 'firing'
-    // state — firing is the instantaneous powering->idle transition on
-    // the tick tick() returns true.
+    // State machine: idle -> aiming -> powering -> (fire, back to idle).
+    // There's no persisted 'firing' state — firing is the instantaneous
+    // powering->idle transition on the tick tick() returns true.
     this.state = 'idle';
-    this.plan = null;    // { angle, power, targetLetter, moveToX }, set by startTurn() via _planShot()
+    this.plan = null;    // { angle, power, targetLetter }, set by startTurn() via _planShot()
     this.turnsTaken = 0; // grows within a level, shrinks bot's wind error over time
     this._levelSeen = null; // last game.currentLevel seen, used to reset turnsTaken on a new level
-    this._moveTicks = 0; // safety counter for the 'moving' state, see tick()
-    this._MAX_MOVE_TICKS = 600; // ~20s of ticks at 30/s — generous upper bound so a stuck move can't stall the turn forever
 
-    // No fixed epsilon needed: tick() compares `diff` directly against
-    // TURRET_DEG_PER_SEC*dt / POWER_PER_SEC*dt, i.e. exactly how far one
-    // more tick would move — that's what stops it from ever overshooting
-    // and oscillating.
+    this._ANGLE_EPS = 1.2;  // degrees; matches ~1 tick of rotation at turretPsDeg*dt
+    this._POWER_EPS = 1.2;  // power-points; matches ~1 tick of powerPs*dt
   }
 
   // --- Turn lifecycle (called by TankRoom) ----------------------------
@@ -164,20 +157,7 @@ class Bot {
     this._maybeSpendScore(game); // repair/fuel/parachute purchases, see below — doesn't block aiming
 
     this.plan = this._planShot(game);
-    const tank = game.players.get(this.letter);
-
-    if (!this.plan || !tank) {
-      this.state = 'idle'; // no living target = nothing to do (shouldn't normally happen)
-    } else {
-      // Only enter 'moving' if the plan actually calls for repositioning —
-      // the common case (no dip/blocked-shot problem) skips straight to aiming.
-      const needsMove = Math.abs(this.plan.moveToX - tank.x) > TANK_PS * 0.05; // ignore sub-1-tick differences
-      this.state = needsMove ? 'moving' : 'aiming';
-    }
-
-    this._lastDir = null;   // tracks which direction we're currently holding
-    this._settleTimer = 0;  // countdown for the pause states
-    this._moveTicks = 0;    // reset the 'moving' safety counter for this turn
+    this.state = this.plan ? 'aiming' : 'idle'; // no living target = nothing to do (shouldn't normally happen)
   }
 
   /**
@@ -198,91 +178,32 @@ class Bot {
     const tank = game.players.get(this.letter);
     if (!tank) { this.state = 'idle'; return false; }
 
-    if (this.state === 'moving') {
-      const diff = this.plan.moveToX - tank.x;
-      const step = TANK_PS * dt;
-      this._moveTicks++;
-
-      // Stop cleanly once one more tick would reach/overshoot the target —
-      // same convergence pattern as aiming/powering. Also bail out if fuel
-      // runs dry mid-move (Tank.tick() just no-ops the move in that case,
-      // which would otherwise strand us here forever) or if something
-      // unexpected is preventing progress past a generous tick budget.
-      if (Math.abs(diff) <= step || tank.fuel <= 0 || this._moveTicks > this._MAX_MOVE_TICKS) {
-        tank.stopAdjustment();
-        this._lastDir = null;
-        this.state = 'settle';
-        this._settleTimer = 0.15;
-        this._next = 'aiming';
-        return false;
-      }
-
-      const dir = diff > 0 ? 'right' : 'left';
-      if (this._lastDir !== dir) {
-        tank.stopAdjustment();
-        this._lastDir = dir;
-      }
-      if (dir === 'right') tank.moveRight();
-      else tank.moveLeft();
-      return false;
-    }
-
     if (this.state === 'aiming') {
       const diff = this.plan.angle - tank.turretAngle;
-      const step = TURRET_DEG_PER_SEC * dt;
-
-      if (Math.abs(diff) <= step) {
-        tank.stopAdjustment();
-        this._lastDir = null;
-        this.state = 'settle';
-        this._settleTimer = 0.15; // brief human-like pause before powering
-        this._next = 'powering';
-        return false;
+      tank.stopAdjustment();
+      if (Math.abs(diff) <= this._ANGLE_EPS) {
+        this.state = 'powering';
+      } else if (diff > 0) {
+        tank.rotateRight();
+      } else {
+        tank.rotateLeft();
       }
-
-      const dir = diff > 0 ? 'right' : 'left';
-      if (this._lastDir !== dir) {       // only touch flags on an actual direction change
-        tank.stopAdjustment();
-        this._lastDir = dir;
-      }
-      if (dir === 'right') tank.rotateRight();
-      else tank.rotateLeft();
-      return false;
-    }
-
-    if (this.state === 'settle') {
-      this._settleTimer -= dt;
-      if (this._settleTimer <= 0) this.state = this._next;
       return false;
     }
 
     if (this.state === 'powering') {
       const diff = this.plan.power - tank.power;
-      const step = POWER_PER_SEC * dt;
-
-      if (Math.abs(diff) <= step) {
-        tank.stopAdjustment();
-        this._lastDir = null;
-        this.state = 'settle';
-        this._settleTimer = 0.15; // pause right before firing, reads as "steadying the shot"
-        this._next = 'fire';
-        return false;
+      tank.stopAdjustment();
+      if (Math.abs(diff) <= this._POWER_EPS) {
+        this.state = 'idle';
+        this.turnsTaken++;
+        return true; // TankRoom should fire this tank now, same code path as a real "fire" action
+      } else if (diff > 0) {
+        tank.morePower();
+      } else {
+        tank.lessPower();
       }
-      
-      const dir = diff > 0 ? 'more' : 'less';
-      if (this._lastDir !== dir) {
-        tank.stopAdjustment();
-        this._lastDir = dir;
-      }
-      if (dir === 'more') tank.morePower();
-      else tank.lessPower();
       return false;
-    }
-
-    if (this.state === 'fire') {
-      this.turnsTaken++;
-      this.state = 'idle';
-      return true;
     }
 
     return false;
@@ -345,72 +266,14 @@ class Bot {
   }
 
   /**
-   * Solve the best (angle, power) pair for firing from a given origin
-   * point toward (targetX, targetY), via a coarse angle sweep + binary-
-   * searched power at each angle (same approach as the original single-
-   * origin solver), refined near the winner.
-   *
-   * @param {object} game - The active game.
-   * @param {number} originX - Tank body x to solve from.
-   * @param {number} originY - Tank body y to solve from (terrain height at originX).
-   * @param {number} targetX - Aim point x.
-   * @param {number} targetY - Aim point y.
-   * @param {number} minPower - Minimum power to search.
-   * @param {number} maxPower - Maximum power to search.
-   * @param {number} perceivedWind - Wind value to simulate against.
-   * @param {number} [coarseStep] - Degree step for the initial full sweep.
-   *   Callers checking many candidate origins can pass a larger step to
-   *   keep the total search cost down; the refine pass below always
-   *   tightens to 1° regardless.
-   * @returns {{angle: number, power: number, err: number}|null}
-   */
-  _solveFrom(game, originX, originY, targetX, targetY, minPower, maxPower, perceivedWind, coarseStep = 4) {
-    const evaluateAngle = (angleDeg) => {
-      const [ox, oy] = turretOrigin(originX, originY, angleDeg);
-      let lo = minPower, hi = maxPower, best = null;
-
-      for (let i = 0; i < 20; i++) {
-        const mid = (lo + hi) / 2;
-        const res = simulateShot(ox, oy, angleDeg, mid, perceivedWind, game.terrainPosition);
-        const dx = res.x - targetX;
-        const dy = res.y - targetY;
-        const err = Math.hypot(dx, dy);
-
-        if (!best || err < best.err) best = { power: mid, err, res };
-        if (!res.hit) { hi = mid; continue; } // shot vanished off-screen — back off power
-        if (res.x < targetX) lo = mid; else hi = mid;
-      }
-      return best;
-    };
-
-    let best = null;
-    for (let a = -85; a <= 85; a += coarseStep) {
-      const candidate = evaluateAngle(a);
-      if (candidate && (!best || candidate.err < best.err)) best = { ...candidate, angle: a };
-    }
-    if (best) {
-      const centre = best.angle;
-      for (let a = centre - 5; a <= centre + 5; a += 1) {
-        if (a < -90 || a > 90) continue;
-        const candidate = evaluateAngle(a);
-        if (candidate && candidate.err < best.err) best = { ...candidate, angle: a };
-      }
-    }
-    return best;
-  }
-
-  /**
-   * Plan this turn's shot: pick a target, then solve for the best (angle,
-   * power) firing from the tank's current position. If that shot is poor
-   * (or entirely unreachable — e.g. the tank is sitting in a dip and every
-   * angle clips the near rim), also check a few candidate repositions
-   * within the tank's fuel budget and take whichever origin scores best.
-   * Finally adds gaussian aim/power error on top of the chosen solution —
-   * the "misjudged wind + human execution error" design described in the
-   * file header.
+   * Plan this turn's shot: pick a target, then binary-search shot power
+   * at a coarse-then-fine sweep of turret angles against a headless
+   * physics simulation (simulateShot), and finally add gaussian aim/
+   * power error on top of the best solution found — the "misjudged wind
+   * + human execution error" design described in the file header.
    *
    * @param {GameLogic} game - The active game.
-   * @returns {{targetLetter: string, angle: number, power: number, moveToX: number}|null}
+   * @returns {{targetLetter: string, angle: number, power: number}|null}
    *   The plan tick() should chase toward, or null if there's no target
    *   or no reachable solution was found (shouldn't normally happen).
    */
@@ -437,56 +300,45 @@ class Bot {
     const targetX = target.x;
     const targetY = target.y - 10;
 
-    // Baseline: solve from where the tank is already standing.
-    let best = this._solveFrom(game, me.x, me.y, targetX, targetY, minPower, maxPower, perceivedWind, 4);
-    let bestOriginX = me.x;
+    // For a fixed angle, binary-search the power that lands closest to
+    // the target's (x, y), using the headless simulateShot() to
+    // "test-fire" each candidate power without touching the real Projectile.
+    const evaluateAngle = (angleDeg) => {
+      const [ox, oy] = turretOrigin(me.x, me.y, angleDeg);
+      let lo = minPower, hi = maxPower, best = null;
 
-    // If the in-place shot is poor — or nothing was reachable at all,
-    // which is exactly what happens when the tank sits in a dip and every
-    // angle clips the near rim — check whether repositioning finds
-    // something meaningfully better. Bounded by a fuel budget (with a
-    // reserve left over) so the bot doesn't burn its whole tank chasing a
-    // marginal gain, and gated by a hysteresis margin so it doesn't move
-    // for a trivial improvement.
-    //
-    // Calibrated against real numbers: board is 864px wide, CELLSIZE=32,
-    // and movement costs fuel 1:1 per pixel (see Tank.tick()'s moveLeft/
-    // moveRight). A naive large search radius here is expensive — e.g.
-    // 150px would burn 60% of a tank's starting 250 fuel on ONE
-    // reposition. Keep the radius modest (a dip is realistically a few
-    // grid cells wide, not half the board) and align the reserve with
-    // _maybeSpendScore()'s own fuel-low threshold (40) rather than an
-    // unrelated number, so the two don't fight over "how low is too low."
-    const POOR_SHOT_ERR = CELLSIZE * 2;   // ~2 tank-widths off = a clean miss worth investigating
-    const RESERVE_FUEL = 40;              // matches _maybeSpendScore()'s fuel<=40 top-up threshold
-    const IMPROVEMENT_MARGIN = CELLSIZE / 4; // px; must clearly beat the in-place shot, not just nominally
-    const moveBudget = Math.max(0, Math.min(CELLSIZE * 3, me.fuel - RESERVE_FUEL)); // ~3 cells, enough for a typical dip
+      for (let i = 0; i < 20; i++) {
+        const mid = (lo + hi) / 2;
+        const res = simulateShot(ox, oy, angleDeg, mid, perceivedWind, game.terrainPosition);
+        const dx = res.x - targetX;
+        const dy = res.y - targetY;
+        const err = Math.hypot(dx, dy);
 
-    if (moveBudget > 10 && (!best || best.err > POOR_SHOT_ERR)) {
-      const offsets = [-moveBudget, -moveBudget / 2, moveBudget / 2, moveBudget];
-      for (const dx of offsets) {
-        const originX = clamp(me.x + dx, 5, Board.WIDTH - 5);
-        const usedFuel = Math.abs(originX - me.x);
-        if (usedFuel < 5 || usedFuel > moveBudget) continue; // too small to matter, or over budget after clamping
+        if (!best || err < best.err) best = { power: mid, err, res };
+        if (!res.hit) { hi = mid; continue; } // shot vanished off-screen — back off power
+        if (res.x < targetX) lo = mid; else hi = mid;
+      }
+      return best;
+    };
 
-        const originY = game.terrainPosition[clamp(Math.floor(originX), 0, game.terrainPosition.length - 1)];
-        // Coarser sweep here (8° vs 4°) — we're checking several candidate
-        // origins, so keep the per-origin cost down; the refine pass still
-        // tightens to 1° near whatever each sweep finds.
-        const candidate = this._solveFrom(game, originX, originY, targetX, targetY, minPower, maxPower, perceivedWind, 8);
-
-        if (candidate && (!best || candidate.err < best.err - IMPROVEMENT_MARGIN)) {
-          best = candidate;
-          bestOriginX = originX;
-        }
+    // Coarse pass across the full turret range, then refine near the winner.
+    let best = null;
+    for (let a = -85; a <= 85; a += 4) {
+      const candidate = evaluateAngle(a);
+      if (candidate && (!best || candidate.err < best.err)) best = { ...candidate, angle: a };
+    }
+    if (best) {
+      const centre = best.angle;
+      for (let a = centre - 5; a <= centre + 5; a += 1) {
+        if (a < -90 || a > 90) continue;
+        const candidate = evaluateAngle(a);
+        if (candidate && candidate.err < best.err) best = { ...candidate, angle: a };
       }
     }
-
-    if (!best) return null; // no reachable solution found anywhere (shouldn't normally happen)
+    if (!best) return null; // no reachable solution found (shouldn't normally happen)
 
     return {
       targetLetter: target.player,
-      moveToX: bestOriginX,
       angle: clamp(best.angle + gaussian(this.preset.angleError, game.rng), -90, 90),
       power: clamp(best.power + gaussian(this.preset.powerError, game.rng), minPower, maxPower),
     };

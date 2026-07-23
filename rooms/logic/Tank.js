@@ -4,7 +4,7 @@
 // per-tick simulation that drives them. Depends on shared/constants,
 // utils, Board, and Projectile.
 
-const { INITIAL_PARACHUTES , TURRET_LENGTH} = require('../../shared/constants');
+const { INITIAL_PARACHUTES, TURRET_LENGTH, TURRET_DEG_PER_SEC, POWER_PER_SEC, TANK_PS } = require('../../shared/constants');
 const { clamp, radians, sin, cos, randomColour, isValidRGB } = require('./utils');
 const { Board } = require('./Board');
 const { Projectile } = require('./Projectile');
@@ -270,28 +270,24 @@ setPower(power) {
    * @param {number} dt - Elapsed time this tick, in seconds.
    */
   tick(game, dt) {
-    const turretPsDeg = 3 * (180 / Math.PI); // matches client's degrees(3)
-    const tankPs = 60;              // tank px/sec
-    const powerPs = 36;             // power/sec
-
     if (!this.falling) {
       // --- Grounded: process at most one queued input intent this tick ---
       if (this.rotateLeftFlag) {
-        const delta = turretPsDeg * dt;
+        const delta = TURRET_DEG_PER_SEC * dt;
         if (this.turretAngle > -90) {
           this.turretAngle -= delta;
           if (this.turretAngle <= -90) this.turretAngle = -90;
           this.adjustTurret(this.turretAngle);
         }
       } else if (this.rotateRightFlag) {
-        const delta = turretPsDeg * dt;
+        const delta = TURRET_DEG_PER_SEC * dt;
         if (this.turretAngle < 90) {
           this.turretAngle += delta;
           if (this.turretAngle >= 90) this.turretAngle = 90;
           this.adjustTurret(this.turretAngle);
         }
       } else if (this.moveLeftFlag) {
-        const delta = tankPs * dt;
+        const delta = TANK_PS * dt;
         if (this.x - delta >= 0 && this.fuel - delta >= 0) {
           this.x -= delta;
           this.fuel -= delta;
@@ -299,7 +295,7 @@ setPower(power) {
           if (this.y >= Board.HEIGHT) this.selfDestruct(game, 1);
         }
       } else if (this.moveRightFlag) {
-        const delta = tankPs * dt;
+        const delta = TANK_PS * dt;
         if (this.x + delta < Board.WIDTH && this.fuel - delta >= 0) {
           this.x += delta;
           this.fuel -= delta;
@@ -307,10 +303,10 @@ setPower(power) {
           if (this.y >= Board.HEIGHT) this.selfDestruct(game, 1);
         }
       } else if (this.morePowerFlag) {
-        const delta = powerPs * dt;
+        const delta = POWER_PER_SEC * dt;
         this.setPower(this.power + delta);
       } else if (this.lessPowerFlag) {
-        const delta = powerPs * dt;
+        const delta = POWER_PER_SEC * dt;
         this.setPower(this.power - delta);
       }
     } else {

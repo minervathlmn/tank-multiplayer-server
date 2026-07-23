@@ -27,3 +27,28 @@ DIRECTORY MAP:
 
 [ ]     ./app.config.js       server/framework config, imports TankRoom.js
 [ ]     ./index.js            entrypoint, imports app.config.js
+
+
+  syncFullState() {
+    ....
+    for (const [letter, id] of this.letterToSession) {
+      const tank = game.players.get(letter);
+      const tankState = this.state.tanks.get(id);
+      if (!tank || !tankState) continue;
+      this.syncTankState(tank, tankState, game);
+
+      const player = this.state.players.get(id);
+      if (player) player.color = tank.colour.join(",");
+    }
+  }
+
+  update(dt) {
+    ....
+    for (const [letter, id] of this.letterToSession) {
+      const tank = game.players.get(letter);
+      const tankState = this.state.tanks.get(id);
+      if (!tank || !tankState) continue;
+      this.syncTankState(tank, tankState, game);
+    }
+    ....
+  }
